@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sound Lab</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <!-- TOP BAR: projects -->
+    <header class="topbar">
+      <span class="brand">Sound Lab</span>
+      <label class="project-picker">
+        <span class="muted">Project</span>
+        <select id="project-select" title="Switch project"></select>
+      </label>
+      <button id="new-project" class="btn">+ New project</button>
+      <button id="rename-project" class="btn" title="Rename this project (its folder too)">Rename</button>
+      <button id="delete-project" class="btn danger-outline" title="Move this project to the Trash">Delete project</button>
+    </header>
+
+    <!-- MEDIA -->
+    <aside class="panel library" id="library-drop">
+      <header class="panel-head">
+        <h2>Media</h2>
+        <button id="refresh" class="icon-btn" title="Refresh">↻</button>
+      </header>
+
+      <div class="rec-box">
+        <button id="rec-btn" class="rec-btn" title="Start / stop recording">
+          <span class="rec-dot"></span><span id="rec-label">Record</span>
+        </button>
+        <span id="rec-time" class="mono rec-time">00:00</span>
+        <select id="device" title="Microphone"></select>
+      </div>
+      <div id="rec-meter" class="rec-meter hidden" title="Input level">
+        <div id="rec-meter-mask" class="rec-meter-mask"></div>
+        <div id="rec-meter-hold" class="rec-meter-hold"></div>
+      </div>
+      <div class="rec-options">
+        <input id="take-name" class="take-name" type="text" maxlength="60" placeholder="Take name (optional)"
+               title="File name for the next recordings: name.wav, name-2.wav … (empty: rec_HHMMSS.wav)">
+        <label title="Count down 3-2-1 before recording; the countdown is cut from the take">
+          <input id="countdown" type="checkbox" checked> 3-2-1</label>
+      </div>
+
+      <div class="lib-toolbar">
+        <button id="add-files" class="btn">+ Add files</button>
+        <input id="file-input" type="file" multiple hidden
+               accept="audio/*,.m4a,.wav,.mp3,.aiff,.aif,.flac,.aac,.caf,.ogg">
+        <input id="filter" class="filter" type="search" placeholder="Filter…">
+      </div>
+      <div id="library-list" class="library-list"></div>
+      <p class="hint">Drop files from Finder · drag to the editor or double-click</p>
+    </aside>
+
+    <!-- EDITOR -->
+    <main class="panel editor" id="editor-drop">
+      <header class="panel-head">
+        <h2>Editor</h2>
+        <span id="track-count" class="muted mono">0/3</span>
+        <div class="enhance-settings">
+          <select id="preset" title="DSP preset (also used for export)"></select>
+          <select id="target" title="Target loudness (also used for export)">
+            <option value="-16">-16 LUFS</option>
+            <option value="-14">-14 LUFS (social)</option>
+          </select>
+        </div>
+      </header>
+
+      <div id="editor-empty" class="empty">Drag up to 3 recordings here from Media</div>
+      <div id="lanes" class="lanes hidden"></div>
+    </main>
+
+    <!-- TIMELINE -->
+    <section class="panel timeline" id="timeline-drop">
+      <header class="panel-head">
+        <h2>Timeline</h2>
+        <button id="tl-play" class="btn primary" title="Play the timeline (Space after clicking here)">▶ Play</button>
+        <span class="mono tl-time"><span id="tl-pos">0:00.0</span> / <span id="total">0:00.0</span></span>
+        <div class="export">
+          <span id="enhance-warn" class="enhance-warn hidden"></span>
+          <label><input id="enhance" type="checkbox" checked> Enhance</label>
+          <select id="format"><option value="m4a">M4A</option><option value="wav">WAV</option></select>
+          <button id="clear-timeline" class="btn">Clear</button>
+          <button id="export" class="btn primary">Join &amp; Export</button>
+        </div>
+      </header>
+      <div id="track-scroll" class="track-scroll">
+        <div id="ruler" class="ruler" title="Click or drag to move the playhead"></div>
+        <div id="track" class="track">
+          <div id="track-empty" class="empty small">Drag clips here · drag cards to reorder</div>
+        </div>
+        <div id="tl-cursor" class="tl-cursor hidden"></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- One editor track (cloned up to 3 times) -->
+  <template id="lane-tpl">
+    <div class="lane" data-ready="false">
+      <div class="lane-head">
+        <span class="lane-num mono"></span>
+        <span class="lane-title"></span>
+        <span class="lane-badge hidden"></span>
+        <span class="lane-zoom">
+          <button class="icon-btn lane-zoom-out" title="Zoom out (−)">−</button>
+          <span class="mono lane-zoom-val" title="Zoom: how much time one pixel of the waveform covers. Pinch or ⌘ + scroll on the waveform, or + / − (0: fit)"></span>
+          <button class="icon-btn lane-zoom-in" title="Zoom in (+)">+</button>
+          <button class="btn lane-zoom-fit" title="Fit the whole recording (0)">Fit</button>
+        </span>
+        <button class="icon-btn lane-close" title="Close track">×</button>
+      </div>
+      <div class="lane-wave"></div>
+      <div class="lane-controls">
+        <button class="btn primary lane-play" title="Play / pause (Space)">▶ Play</button>
+        <div class="io">
+          <span class="io-mark">
+            <span class="mono lane-in-time" title="Start of the trim range (I sets it at the playhead)">0:00.000</span>
+            <button class="io-set lane-set-in" title="Set the start to the playhead (I)">▲</button>
+          </span>
+          <span class="mono lane-pos" title="Playhead (← / → 10 ms, ⇧ 100 ms, ⌥ 1 ms)">0:00.000</span>
+          <span class="io-mark">
+            <span class="mono lane-out-time" title="End of the trim range (O sets it at the playhead)">0:00.000</span>
+            <button class="io-set lane-set-out" title="Set the end to the playhead (O)">▲</button>
+          </span>
+          <span class="tighten">
+            <button class="btn lane-tighten" title="New version of this range (name_tight.wav) in a track below: silence at the start and end trimmed, longer pauses inside shortened. This track stays as it is.">Tighten</button>
+            <span class="tighten-amount">
+              <input class="lane-pause" type="range" min="0.05" max="1" step="0.05" value="0.05"
+                     title="How much to tighten — full left: Skip silence, like Voice Memos">
+              <span class="mono lane-pause-val"></span>
+            </span>
+          </span>
+        </div>
+        <label class="speed">
+          Speed <input class="lane-speed" type="range" min="0.5" max="2" step="0.05" value="1">
+          <span class="mono lane-speed-val">1.00×</span>
+        </label>
+        <div class="lane-actions">
+          <div class="clip-chip lane-chip" draggable="true" title="Drag to the timeline — or into the editor: a new recording of just this selection (<name>_part.wav), in a new track below the track it's dropped on">
+            <span class="grip">⠿</span><span class="mono lane-chip-dur">0:00.0</span>
+          </div>
+          <button class="btn primary lane-add">Add to timeline ↓</button>
+          <button class="btn lane-cancel hidden" title="Stop editing the timeline clip">Cancel</button>
+          <button class="btn lane-ab hidden" title="A/B: switch between this enhanced file and its original (level-matched) at the same position (B)">B · Enhanced</button>
+          <button class="btn enhance lane-enhance" title="Enhance this recording (or its trimmed / sped-up selection)">✨ Enhance</button>
+        </div>
+      </div>
+      <div class="lane-resize" title="Drag to resize"></div>
+    </div>
+  </template>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

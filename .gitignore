@@ -1,0 +1,31 @@
+# User data: recordings, inputs, outputs and the current-project marker
+/projects/
+
+# Downloaded binaries / tool venvs (scripts/install_deepfilter.sh recreates deep-filter)
+/tools/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Stray audio outside projects/ (renders, test fixtures)
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
+
+# One-off session note (see CLAUDE.md)
+HANDOFF.md
+
+# Local env / editors / OS
+.env
+.claude/settings.local.json
+.vscode/
+.idea/
+.DS_Store
