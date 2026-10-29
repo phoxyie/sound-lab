@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from .pipeline import (CODECS, RMS_WINDOW, SAMPLE_RATE, EnhanceOptions, PipelineError, Progress, _ffmpeg, enhance,
+from .pipeline import (CODECS, GENERATIVE, RMS_WINDOW, SAMPLE_RATE, EnhanceOptions, PipelineError, Progress, _ffmpeg, enhance,
                        noise_levels, probe_duration, resolve_outputs, rms_windows)
 
 SPEED_MIN, SPEED_MAX = 0.5, 2.0
@@ -293,7 +293,7 @@ def export_timeline(clips: list[Clip], enhance_it: bool = True, opts: EnhanceOpt
     opts = opts or EnhanceOptions()
     if opts.fmt not in CODECS:
         raise PipelineError(f"Unknown format: {opts.fmt}")
-    out = _export_path(resolve_outputs(opts), opts.fmt, "resemble_" if enhance_it and opts.denoiser == "resemble" else "")
+    out = _export_path(resolve_outputs(opts), opts.fmt, f"{opts.denoiser}_" if enhance_it and opts.denoiser in GENERATIVE else "")
 
     with tempfile.TemporaryDirectory(prefix="soundlab-edit-") as tmp:
         joined = Path(tmp) / "joined.wav"

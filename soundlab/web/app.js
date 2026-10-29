@@ -380,27 +380,53 @@ async function initConfig() {
   for (const p of cfg.presets) sel.append(new Option(p === cfg.default_preset ? `${p} (default)` : p, p));
   sel.value = cfg.default_preset;
   $("target").value = String(cfg.default_target);
-  initResemble(cfg.resemble);
+  markInstalled("sidon", "Sidon", cfg.sidon.installed, "./scripts/install_sidon.sh");
+  initResemble(cfg.resemble, { sidon: cfg.sidon.installed });
+}
+
+// Optional denoisers that aren't installed stay in the list, disabled, with how to install them
+function markInstalled(value, label, installed, script) {
+  const opt = $("denoiser").querySelector(`option[value="${value}"]`);
+  opt.disabled = !installed;
+  if (!installed) {
+    opt.textContent = `${label} (not installed)`;
+    opt.title = script;
+  }
 }
 
 // ---------- Resemble Enhance settings (denoiser choice + tuning, kept in localStorage) ----------
 
-const resemble = { defaults: null, installed: false };
+const resemble = { defaults: null, installed: false, rate: null, confirmAbove: 60 };
 
-function initResemble(info) {
+function fmtEta(sec) {
+  if (sec < 90) return `${Math.round(sec)} s`;
+  const min = Math.round(sec / 60);
+  return min < 60 ? `${min} min` : `${Math.floor(min / 60)} h ${min % 60} min`;
+}
+
+// Resemble runs at ~3–4× the audio's length on the CPU: a long job asks first, with the estimate
+function resembleOk(seconds) {
+  if ($("denoiser").value !== "resemble" || !resemble.rate) return true;
+  const est = seconds * (resemble.rate[0] + resemble.rate[1] * resembleSettings().nfe);
+  if (est <= resemble.confirmAbove) return true;
+  return confirm(`Resemble Enhance will take about ${fmtEta(est)} for ${fmt(seconds)} of audio `
+    + `(CPU, ~${(est / seconds).toFixed(1)}× its length — longer if the Mac gets hot and slows down).\n\n`
+    + "Tip: edit first and enhance only the final export (Join & Export), or use DeepFilterNet "
+    + "while you try things out.\n\nStart now?");
+}
+
+function initResemble(info, others) {
   resemble.defaults = info.defaults;
   resemble.installed = info.installed;
-  const opt = $("denoiser").querySelector('option[value="resemble"]');
-  opt.disabled = !info.installed;
-  if (!info.installed) {
-    opt.textContent = "Resemble Enhance (not installed)";
-    opt.title = "./scripts/install_resemble.sh";
-  }
+  resemble.rate = info.rate;
+  resemble.confirmAbove = info.confirm_above_sec;
+  markInstalled("resemble", "Resemble Enhance", info.installed, "./scripts/install_resemble.sh");
   for (const s of info.solvers) $("rs-solver").append(new Option(s === info.defaults.solver ? `${s} (default)` : s, s));
   $("rs-seed").max = info.seed_max;
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(ENHANCE_KEY)) || {}; } catch { /* ignore */ }
-  $("denoiser").value = info.installed && saved.denoiser === "resemble" ? "resemble" : "auto";
+  const available = { resemble: info.installed, ...others };
+  $("denoiser").value = available[saved.denoiser] ? saved.denoiser : "auto";
   setResembleFields({ ...info.defaults, ...(saved.resemble || {}) });
   updateDenoiserUI();
 }
@@ -1077,6 +1103,7 @@ async function enhanceLane(lane) {
   if (!lane?.path) return;
   if (lane.job) { cancelJob(lane.job); return; } // a second click while it runs cancels it
   if (lane.enhancing) return; // starting
+  if (!resembleOk(clipLength(lane))) return;
   const btn = lane.q(".lane-enhance");
   const title = btn.title;
   lane.enhancing = true;
@@ -1342,6 +1369,7 @@ const exporting = { job: null, starting: false };
 $("export").addEventListener("click", async () => {
   if (exporting.job) { cancelJob(exporting.job); return; } // a second click while it runs cancels it
   if (exporting.starting) return;
+  if ($("enhance").checked && !resembleOk(tlTotal())) return;
   const btn = $("export");
   exporting.starting = true;
   btn.classList.add("busy");
@@ -1378,6 +1406,9 @@ $("denoiser").addEventListener("change", () => {
   if ($("denoiser").value === "resemble") {
     toast("Resemble Enhance: rebuilds the voice and runs on the CPU — about 3–4× the recording's length. "
       + "Tune it under ⚙ Settings.", "ok", 6000);
+  } else if ($("denoiser").value === "sidon") {
+    toast("Sidon: rebuilds the voice at 48 kHz (generative) — fast, about half the recording's length. "
+      + "No settings.", "ok", 6000);
   }
 });
 $("resemble-btn").addEventListener("click", (e) => {

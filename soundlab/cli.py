@@ -9,8 +9,9 @@ from pathlib import Path
 
 from . import projects
 from .compare import compare
-from .pipeline import (CODECS, DENOISERS, RESEMBLE_SOLVERS, EnhanceOptions, PipelineError, ResembleSettings,
-                       enhance, find_deep_filter, find_resemble)
+from .pipeline import (CODECS, DENOISERS, GENERATIVE, RESEMBLE_SOLVERS, EnhanceOptions, PipelineError, ResembleSettings,
+                       enhance, estimate_resemble_seconds, find_deep_filter, find_resemble, find_sidon,
+                       probe_duration)
 from .presets import PRESETS
 from .recorder import list_audio_devices, record
 
@@ -28,6 +29,10 @@ def _progress_printer():
     return show if sys.stdout.isatty() else None
 
 
+def _fmt_eta(sec: float) -> str:
+    return f"{sec:.0f} s" if sec < 90 else f"{sec / 60:.0f} min"
+
+
 def cmd_enhance(args: argparse.Namespace) -> int:
     opts = EnhanceOptions(
         preset=args.preset,
@@ -42,7 +47,10 @@ def cmd_enhance(args: argparse.Namespace) -> int:
     for f in args.files:
         print(f"▶ {f}")
         try:
-            r = enhance(Path(f), opts, progress=_progress_printer() if opts.denoiser == "resemble" else None)
+            if opts.denoiser == "resemble" and Path(f).is_file():
+                est = estimate_resemble_seconds(probe_duration(Path(f)), opts.resemble.nfe)
+                print(f"    Resemble Enhance: ~{_fmt_eta(est)} (CPU; tip: edit first, enhance the final export)")
+            r = enhance(Path(f), opts, progress=_progress_printer() if opts.denoiser in GENERATIVE else None)
         except PipelineError as e:
             print(f"  ✗ {e}", file=sys.stderr)
             failed += 1
@@ -121,6 +129,8 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     resemble = find_resemble()  # optional
     print(f"{'✓' if resemble else '–'} Resemble Enhance (optional): "
           f"{resemble or 'not installed — ./scripts/install_resemble.sh'}")
+    sidon = find_sidon()  # optional
+    print(f"{'✓' if sidon else '–'} Sidon (optional): {sidon or 'not installed — ./scripts/install_sidon.sh'}")
     try:
         mics = list_audio_devices()
         print(f"✓ sounddevice (recording): {', '.join(mics) or 'no input device'}")
@@ -138,7 +148,8 @@ def main(argv: list[str] | None = None) -> int:
     enhance_opts = argparse.ArgumentParser(add_help=False)
     enhance_opts.add_argument("--preset", choices=list(PRESETS), default=EnhanceOptions.preset)
     enhance_opts.add_argument("--denoiser", choices=DENOISERS, default="auto",
-                              help="resemble: Resemble Enhance (slow, CPU; generative voice rebuild)")
+                              help="resemble: Resemble Enhance (slow, CPU; generative voice rebuild); "
+                                   "sidon: Sidon (fast, CPU; generative, no settings)")
     enhance_opts.add_argument("--atten", type=float, default=30.0, help="DeepFilterNet max suppression (dB)")
     rs = ResembleSettings()
     enhance_opts.add_argument("--tau", type=float, default=rs.tau,

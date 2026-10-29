@@ -26,9 +26,10 @@ from werkzeug.serving import make_server
 
 from . import projects
 from .editor import PAUSE_MAX, Clip, export_timeline, extract, keep_segments, render, tighten
-from .pipeline import (CODECS, PROJECT_ROOT, RESEMBLE_NFE_MAX, RESEMBLE_SEED_MAX, RESEMBLE_SOLVERS, Cancelled,
+from .pipeline import (CODECS, PROJECT_ROOT, RESEMBLE_NFE_MAX, RESEMBLE_RATE_A, RESEMBLE_RATE_B, RESEMBLE_SEED_MAX,
+                       RESEMBLE_SOLVERS, Cancelled,
                        EnhanceOptions, PipelineError, Progress, ResembleSettings, _ffmpeg, enhance, find_resemble,
-                       measure_loudness)
+                       find_sidon, measure_loudness)
 from .presets import PRESETS
 from .recorder import Recorder, list_audio_devices, pick_device
 
@@ -46,7 +47,9 @@ TARGET_MIN, TARGET_MAX = -30.0, -9.0
 PREVIEW_DIR = Path(tempfile.gettempdir()) / "soundlab-preview"
 PREVIEW_KEEP = 20
 JOBS_KEEP = 20  # finished jobs kept for status polling
-GUI_DENOISERS = ["auto", "resemble"]  # auto = DeepFilterNet (afftdn if it's missing)
+GUI_DENOISERS = ["auto", "resemble", "sidon"]  # auto = DeepFilterNet (afftdn if it's missing)
+# Resemble jobs estimated to take longer than this ask first (overridable so the e2e test can see the dialog)
+RESEMBLE_CONFIRM_SEC = float(os.environ.get("SOUNDLAB_RESEMBLE_CONFIRM_SEC", "60"))
 
 app = Flask(__name__, static_folder=str(WEB_DIR), static_url_path="/static")
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024**3  # import size limit: 2 GB
@@ -318,7 +321,9 @@ def config():
     return jsonify(presets=list(PRESETS), default_preset=EnhanceOptions.preset,
                    default_target=EnhanceOptions.target_i, formats=list(CODECS),
                    resemble={"installed": find_resemble() is not None, "defaults": asdict(ResembleSettings()),
-                             "solvers": RESEMBLE_SOLVERS, "nfe_max": RESEMBLE_NFE_MAX, "seed_max": RESEMBLE_SEED_MAX})
+                             "solvers": RESEMBLE_SOLVERS, "nfe_max": RESEMBLE_NFE_MAX, "seed_max": RESEMBLE_SEED_MAX,
+                             "rate": [RESEMBLE_RATE_A, RESEMBLE_RATE_B], "confirm_above_sec": RESEMBLE_CONFIRM_SEC},
+                   sidon={"installed": find_sidon() is not None})
 
 
 def _resemble_settings(raw: dict | None) -> ResembleSettings:
@@ -349,6 +354,8 @@ def _enhance_options(body: dict) -> EnhanceOptions:
         raise PipelineError(f"Unknown denoiser: {denoiser}")
     if denoiser == "resemble" and not find_resemble():
         raise PipelineError("Resemble Enhance isn't installed: run ./scripts/install_resemble.sh")
+    if denoiser == "sidon" and not find_sidon():
+        raise PipelineError("Sidon isn't installed: run ./scripts/install_sidon.sh")
     return EnhanceOptions(preset=preset, target_i=target, fmt=fmt, outputs_root=projects.current().outputs,
                           denoiser=denoiser, resemble=_resemble_settings(body.get("resemble")))
 

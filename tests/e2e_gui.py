@@ -6,7 +6,7 @@ the playhead can't leave the trim range, I/O trim, speed, preview, replace a tra
 close tracks → timeline: drag in, reorder, edit a clip from its card and update it, play with a
 moving cursor, seek on the ruler → enhance → A/B
 original ↔ enhanced → "already enhanced" warning → Resemble Enhance (settings, progress, report,
-cancel; if installed) → join & export → timeline survives
+cancel; if installed) → Sidon (report; if installed) → join & export → timeline survives
 a reload → Show in Finder → record (3-2-1, level meter, named take, cancel) → move to Trash → project isolation →
 rename → delete the project.
 
@@ -151,6 +151,35 @@ def workers(server_pid: int) -> list[str]:
     return r.stdout.split()
 
 
+def sidon_steps(page: Page, shots: Path, lanes: Locator) -> None:
+    page.locator("#denoiser").select_option("sidon")
+    expect(page.locator("#toast")).to_contain_text("Sidon: rebuilds the voice")
+    hide_toast(page)
+    expect(page.locator("#resemble-btn")).to_be_hidden()  # no settings
+    page.screenshot(path=str(shots / "3_sidon.png"))
+    saved = page.evaluate("JSON.parse(localStorage.getItem('soundlab.enhance'))")
+    assert saved["denoiser"] == "sidon", saved
+    lane = lanes.nth(0)
+    btn = lane.locator(".lane-enhance")
+    expected = parse_time(lane.locator(".lane-chip-dur").inner_text())
+    count = lanes.count()
+    btn.click()
+    out = toast_path(page, "Enhanced")
+    expect(btn).to_have_text("✨ Enhance")
+    report = json.loads(out.with_suffix(".json").read_text())
+    assert "_sidon_" in out.name, out  # edit_sidon_HHMMSS (the track is trimmed)
+    assert report["options"]["denoiser"] == "sidon" and "resemble" not in report["options"], report["options"]
+    assert report["denoiser"].startswith("sidon v0.1"), report["denoiser"]
+    assert report["normalization_type"] == "linear", report["normalization_type"]
+    got = duration(out)
+    assert abs(got - expected) < 0.1, (got, expected)
+    expect(lanes).to_have_count(count + 1)
+    lanes.nth(1).locator(".lane-close").click()
+    expect(lanes).to_have_count(count)
+    step(f"Sidon enhance: {out.name} ({got:.2f}s), no settings, {report['elapsed_sec']}s")
+    page.locator("#denoiser").select_option("auto")
+
+
 def resemble_steps(page: Page, shots: Path, lanes: Locator, outputs: Path, server_pid: int) -> None:
     page.locator("#denoiser").select_option("resemble")
     expect(page.locator("#toast")).to_contain_text("Resemble Enhance: rebuilds the voice")
@@ -182,6 +211,16 @@ def resemble_steps(page: Page, shots: Path, lanes: Locator, outputs: Path, serve
     btn = lane.locator(".lane-enhance")
     expected = parse_time(lane.locator(".lane-chip-dur").inner_text())
     count = lanes.count()
+    # A long job asks first with the estimate (the test lowers the threshold): No → nothing starts
+    messages: list[str] = []
+    page.once("dialog", lambda d: (messages.append(d.message), d.dismiss()))
+    btn.click()
+    page.wait_for_timeout(300)
+    assert messages and "Resemble Enhance will take about" in messages[0], messages
+    expect(btn).to_have_text("✨ Enhance")
+    assert not workers(server_pid)
+    estimate = re.search(r"about (\S+ \w+) for", messages[0]).group(1)
+    page.once("dialog", lambda d: d.accept())
     btn.click()
     expect(btn).to_have_text(re.compile(r"^\d+% · Cancel$"), timeout=10_000)
     page.screenshot(path=str(shots / "3_resemble_progress.png"))
@@ -197,10 +236,12 @@ def resemble_steps(page: Page, shots: Path, lanes: Locator, outputs: Path, serve
     expect(lanes).to_have_count(count + 1)
     lanes.nth(1).locator(".lane-close").click()
     expect(lanes).to_have_count(count)
-    step(f"Resemble enhance: {out.name} ({got:.2f}s), settings in its report, {report['elapsed_sec']}s")
+    step(f"Resemble enhance: asked first (estimate {estimate}, 'No' started nothing), {out.name} ({got:.2f}s), "
+         f"settings in its report, {report['elapsed_sec']}s")
 
     # A second click cancels: no output, and the worker process is gone
     before = sorted(outputs.rglob("*.*"))
+    page.once("dialog", lambda d: d.accept())
     btn.click()
     expect(btn).to_have_text(re.compile(r"% · Cancel$"))
     deadline = time.monotonic() + 15
@@ -697,6 +738,12 @@ def run(page: Page, base: str, shots: Path, fixtures: list[Path], trash: Path,
         step("Resemble Enhance not installed: its option is disabled (steps skipped)")
     else:
         resemble_steps(page, shots, lanes, ROOT / "projects" / project / "outputs", server_pid)
+    from soundlab.pipeline import find_sidon
+    if not find_sidon():
+        expect(page.locator('#denoiser option[value="sidon"]')).to_be_disabled()
+        step("Sidon not installed: its option is disabled (steps skipped)")
+    else:
+        sidon_steps(page, shots, lanes)
 
     # Join & export — expected length = sum of cards
     expected = parse_time(page.locator("#total").inner_text())
@@ -822,7 +869,9 @@ def main() -> int:
     fixtures = make_fixtures(work)
     env = {**os.environ, "SOUNDLAB_TRASH": str(trash), "SOUNDLAB_REVEAL_CMD": "true",
            # never the real microphone: a generated tone, in real time
-           "SOUNDLAB_RECORD_INPUT": "tone:330"}
+           "SOUNDLAB_RECORD_INPUT": "tone:330",
+           # every Resemble job asks first, so the duration dialog shows up for the short test clips
+           "SOUNDLAB_RESEMBLE_CONFIRM_SEC": "1"}
     project = f"e2e-{os.getpid()}"
     current_file = ROOT / "projects" / ".current"
     original = current_file.read_text().strip() if current_file.exists() else "Default"

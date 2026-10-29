@@ -7,7 +7,7 @@ Brings voice recordings made on a MacBook's built-in mic up to social media / po
 
 ```bash
 brew install ffmpeg                  # skip if already installed
-./scripts/install_deepfilter.sh      # DeepFilterNet3 → tools/deep-filter
+./scripts/install_deepfilter.sh      # DeepFilterNet3 → tools/deep-filter (SHA-256 checked)
 
 python3 -m venv .venv                # Python >= 3.10
 source .venv/bin/activate
@@ -21,10 +21,12 @@ Activate the environment in every new terminal with `source .venv/bin/activate`
 
 Without `deep-filter` the pipeline falls back to ffmpeg's `afftdn` denoiser automatically.
 
-Optional, **Resemble Enhance** (a second denoiser, see below; ~1.6 GB, needs Python 3.10 or 3.11):
+Optional generative denoisers (see below), each in its own venv under `tools/`, with pinned
+versions and checksummed model files:
 
 ```bash
-./scripts/install_resemble.sh        # own venv → tools/resemble-venv, weights → tools/resemble-model
+./scripts/install_resemble.sh        # Resemble Enhance, ~1.6 GB, Python 3.10 or 3.11
+./scripts/install_sidon.sh           # Sidon, ~2 GB, Python 3.11+
 ```
 
 ## Usage
@@ -33,7 +35,7 @@ Optional, **Resemble Enhance** (a second denoiser, see below; ~1.6 GB, needs Pyt
 soundlab enhance take.m4a                       # default: -16 LUFS, m4a
 soundlab enhance *.m4a --target -14             # louder, for social media
 soundlab enhance take.m4a --format wav          # 24-bit WAV master
-soundlab enhance take.m4a --denoiser afftdn     # deepfilter | resemble | afftdn | none
+soundlab enhance take.m4a --denoiser afftdn     # deepfilter | resemble | sidon | afftdn | none
 soundlab enhance take.m4a --preset voice-b      # alternative DSP chain
 ```
 
@@ -44,7 +46,10 @@ instead of DeepFilterNet: it removes the noise and then **rebuilds the voice** w
 model. In the first ear test (an 8 s MacBook take) it beat DeepFilterNet: the pauses come out
 ~13 dB quieter (−64 vs −51 dB). Because it generates the audio, listen before you use a result.
 It runs on the **CPU** (it crashes on the Mac's GPU) and takes about **3–4× the recording's length**
-(a 34 s take: 2 min). DeepFilterNet stays the default.
+(a 34 s take: 2 min; 10 min: ~35 min, more once the fanless MacBook Air gets hot and slows down).
+DeepFilterNet stays the default. Edit first and enhance only the final export: Resemble then processes
+just the finished content (Tighten alone cut a take by ~22%). The CLI prints the estimate before it
+starts; the GUI asks first when a job would take over a minute.
 
 ```bash
 soundlab enhance take.wav --denoiser resemble                 # ear-tested defaults
@@ -61,6 +66,17 @@ soundlab enhance take.wav --denoiser resemble --tau 0.3 --seed 7
 
 Its *denoise-only* mode isn't offered: on a real take it removed nothing (the output equalled the
 input). Outputs get `_resemble` in their name, and the report lists the settings.
+
+### Sidon
+
+`--denoiser sidon` uses [Sidon](https://github.com/sarulab-speech/Sidon) (University of Tokyo, MIT),
+an open reproduction of Google's Miipher: a w2v-BERT 2.0 model predicts clean speech features from a
+16 kHz copy of the input and a decoder synthesises 48 kHz speech from them — so everything above
+8 kHz is generated. It's **fast** (~0.45× the recording's length on the CPU: a 34 s take in 15 s,
+~7× faster than Resemble), multilingual, deterministic and has no settings. On the first test take
+it removed less noise than Resemble (pauses −57 vs −64 dB) and changed the voice's tone the most
+(1–3 kHz +2 dB) — listen before you use it. CPU only: its CPU model files fail on the Mac GPU.
+Outputs get `_sidon` in their name. It runs offline; everything loads from `tools/sidon-model`.
 
 ### Projects
 
@@ -115,11 +131,12 @@ soundlab gui        # opens http://127.0.0.1:8765 in the browser
   20 ms windows under a threshold between the recording's noise floor and speech level; a `_tight`
   file keeps those levels, so tightening it again changes (almost) nothing.
   **✨ Enhance** works the same way: the enhanced version opens in a new track right below.
-  The editor header picks the denoiser for Enhance and Export — **DeepFilterNet** (default) or
-  **Resemble Enhance** — and its **⚙ Settings** (Temperature, Strength, Steps, Solver, Variation, 🎲 for
+  The editor header picks the denoiser for Enhance and Export — **DeepFilterNet** (default),
+  **Resemble Enhance** or **Sidon** (not installed ones are greyed out) — and Resemble's **⚙ Settings** (Temperature, Strength, Steps, Solver, Variation, 🎲 for
   a random one, *Reset to defaults*; a • marks changed settings). The choice and settings are
-  remembered in the browser. While Enhance or Export runs, the button shows the progress; click it
-  again to cancel.
+  remembered in the browser. A Resemble job estimated to take over a minute asks first, with the
+  estimate (~2.5 + 0.03 × Steps seconds per second of audio). While Enhance or Export runs, the
+  button shows the progress; click it again to cancel.
   The **⠿ chip** next to *Add to timeline* drags the selection (trim + speed) to the timeline — or,
   dropped in the editor, makes it a recording of its own: `<name>_part.wav` (lossless, in `inputs/`,
   the source untouched) opens in a new track below the track it lands on, or at the end on empty
@@ -181,7 +198,7 @@ soundlab compare take.m4a
 ```
 
 Processes the same recording stage by stage (unprocessed → light/full DeepFilterNet → EQ, + Resemble
-Enhance with its defaults if it's installed) into WAV variants all at the same loudness:
+Enhance with its defaults and Sidon if they're installed) into WAV variants all at the same loudness:
 `<project>/outputs/YYYY-MM-DD/compare_<name>_<time>/`. Use it to hear which stage improves or harms
 the sound.
 
@@ -202,8 +219,8 @@ recording runs on a generated tone (`SOUNDLAB_RECORD_INPUT=tone:330`).
 ## Pipeline
 
 1. 80 Hz high-pass, 48 kHz mono WAV
-2. Denoise: DeepFilterNet3 (`-a 30 --pf`), Resemble Enhance (`soundlab/resemble_worker.py`, run with
-   its own venv's Python) or `afftdn`
+2. Denoise: DeepFilterNet3 (`-a 30 --pf`), Resemble Enhance / Sidon (`soundlab/resemble_worker.py`,
+   `soundlab/sidon_worker.py`, each run with its own venv's Python, offline) or `afftdn`
 3. DSP chain (EQ, de-esser, compressor) — `soundlab/presets.py`
 4. Pre-gain + `alimiter`: keeps peaks under the TP target
 5. 2-pass `loudnorm` (`linear=true`): dynamics stay intact

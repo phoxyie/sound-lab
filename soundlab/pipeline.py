@@ -1,6 +1,6 @@
 """Voice enhancement pipeline.
 
-Flow: 80 Hz HPF + 48 kHz mono WAV → denoise (DeepFilterNet3 / Resemble Enhance / afftdn)
+Flow: 80 Hz HPF + 48 kHz mono WAV → denoise (DeepFilterNet3 / Resemble Enhance / Sidon / afftdn)
 → DSP chain → 2-pass linear loudnorm → outputs/YYYY-MM-DD/
 """
 
@@ -35,13 +35,23 @@ CODECS = {
 }
 
 
-DENOISERS = ["auto", "deepfilter", "resemble", "afftdn", "none"]
+DENOISERS = ["auto", "deepfilter", "resemble", "sidon", "afftdn", "none"]
+GENERATIVE = {"resemble", "sidon"}  # rebuild the voice; tagged in output names, run as external workers
 RESEMBLE_VENV = PROJECT_ROOT / "tools" / "resemble-venv"
 RESEMBLE_MODEL = PROJECT_ROOT / "tools" / "resemble-model" / "enhancer_stage2"
 RESEMBLE_WORKER = Path(__file__).resolve().parent / "resemble_worker.py"
 RESEMBLE_SOLVERS = ["midpoint", "rk4", "euler"]
 RESEMBLE_NFE_MAX = 128
 RESEMBLE_SEED_MAX = 9999
+# Seconds of work per second of audio = A + B × nfe — measured on the M1 MacBook Air, CPU, a 34 s take
+# (nfe 16: 2.97×, 32: 3.57×, 64: 4.44×; the 8.4 s take fits too). Long runs may be slower once the
+# fanless Mac throttles, so the estimate is a lower bound; clips of a few seconds take ~5 s more
+# (model load) — they stay far under the GUI's confirm threshold anyway.
+RESEMBLE_RATE_A, RESEMBLE_RATE_B = 2.52, 0.0305
+SIDON_VENV = PROJECT_ROOT / "tools" / "sidon-venv"
+SIDON_MODEL = PROJECT_ROOT / "tools" / "sidon-model"
+SIDON_WORKER = Path(__file__).resolve().parent / "sidon_worker.py"
+SIDON_FILES = ["feature_extractor_cpu.pt", "decoder_cpu.pt", "preprocessor_config.json"]
 
 
 @dataclass
@@ -75,7 +85,7 @@ class ResembleSettings:
 @dataclass
 class EnhanceOptions:
     preset: str = "flat"  # ear test: full DeepFilterNet without EQ sounded best
-    denoiser: str = "auto"  # auto | deepfilter | resemble | afftdn | none
+    denoiser: str = "auto"  # auto | deepfilter | resemble | sidon | afftdn | none
     atten_lim_db: float = 30.0
     postfilter: bool = True
     resemble: ResembleSettings = field(default_factory=ResembleSettings)
@@ -121,6 +131,17 @@ def find_resemble() -> Path | None:
     python = RESEMBLE_VENV / "bin" / "python"
     weights = RESEMBLE_MODEL / "ds" / "G" / "default" / "mp_rank_00_model_states.pt"
     return python if python.is_file() and weights.is_file() else None
+
+
+def estimate_resemble_seconds(duration_sec: float, nfe: int) -> float:
+    """Rough processing time of Resemble Enhance for this much audio (see RESEMBLE_RATE_A/B)."""
+    return duration_sec * (RESEMBLE_RATE_A + RESEMBLE_RATE_B * nfe)
+
+
+def find_sidon() -> Path | None:
+    """The Python of Sidon's own venv, if it and the model are installed."""
+    python = SIDON_VENV / "bin" / "python"
+    return python if python.is_file() and all((SIDON_MODEL / f).is_file() for f in SIDON_FILES) else None
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -216,7 +237,7 @@ def _output_path(src: Path, opts: EnhanceOptions) -> Path:
     now = datetime.now()
     day_dir = resolve_outputs(opts) / now.strftime("%Y-%m-%d")
     day_dir.mkdir(parents=True, exist_ok=True)
-    tag = f"{opts.preset}_resemble" if opts.denoiser == "resemble" else opts.preset
+    tag = f"{opts.preset}_{opts.denoiser}" if opts.denoiser in GENERATIVE else opts.preset
     base = f"{src.stem}_{tag}_{now.strftime('%H%M%S')}"
     out = day_dir / f"{base}.{opts.fmt}"
     n = 2
@@ -226,18 +247,15 @@ def _output_path(src: Path, opts: EnhanceOptions) -> Path:
     return out
 
 
-def _resemble(raw: Path, work: Path, rs: ResembleSettings, progress: Progress) -> Path:
-    python = find_resemble()
-    if not python:
-        raise PipelineError("Resemble Enhance isn't installed: run ./scripts/install_resemble.sh")
-    out = work / "resemble.wav"
-    err_log = work / "resemble.log"
-    cmd = [str(python), "-I", str(RESEMBLE_WORKER), str(raw), str(out), str(RESEMBLE_MODEL),
-           str(rs.tau), str(int(rs.nfe)), str(rs.lambd), rs.solver, str(int(rs.seed))]
-    env = {**os.environ, "TQDM_DISABLE": "1"}
-    with open(err_log, "w") as err:
+def _run_worker(name: str, cmd: list[str], out: Path, log_file: Path, progress: Progress) -> Path:
+    """Runs a model worker (its own venv's Python) that prints {"progress": 0..1} JSON lines.
+
+    No network: Hugging Face libraries in the workers run offline, everything is loaded from tools/.
+    """
+    env = {**os.environ, "TQDM_DISABLE": "1", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+    with open(log_file, "w") as err:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True, env=env)
-        # Its first progress line can take ~20 s (model load + the first chunk's denoise pass), so the
+        # A progress line can take ~20 s (Resemble: model load + the first chunk's denoise pass), so the
         # lines are read in a thread and progress is reported every PROGRESS_POLL_SEC regardless:
         # a cancel raised from the callback then stops the worker right away.
         lines: queue.Queue[str | None] = queue.Queue()
@@ -269,9 +287,28 @@ def _resemble(raw: Path, work: Path, rs: ResembleSettings, progress: Progress) -
                 proc.kill()
                 proc.wait()
     if proc.returncode != 0 or not out.is_file():
-        tail = "\n".join(err_log.read_text(errors="replace").strip().splitlines()[-10:])
-        raise PipelineError(f"Resemble Enhance failed (exit {proc.returncode})\n{tail}")
+        tail = "\n".join(log_file.read_text(errors="replace").strip().splitlines()[-10:])
+        raise PipelineError(f"{name} failed (exit {proc.returncode})\n{tail}")
     return out
+
+
+def _resemble(raw: Path, work: Path, rs: ResembleSettings, progress: Progress) -> Path:
+    python = find_resemble()
+    if not python:
+        raise PipelineError("Resemble Enhance isn't installed: run ./scripts/install_resemble.sh")
+    out = work / "resemble.wav"
+    cmd = [str(python), "-I", str(RESEMBLE_WORKER), str(raw), str(out), str(RESEMBLE_MODEL),
+           str(rs.tau), str(int(rs.nfe)), str(rs.lambd), rs.solver, str(int(rs.seed))]
+    return _run_worker("Resemble Enhance", cmd, out, work / "resemble.log", progress)
+
+
+def _sidon(raw: Path, work: Path, progress: Progress) -> Path:
+    python = find_sidon()
+    if not python:
+        raise PipelineError("Sidon isn't installed: run ./scripts/install_sidon.sh")
+    out = work / "sidon.wav"
+    cmd = [str(python), "-I", str(SIDON_WORKER), str(raw), str(out), str(SIDON_MODEL)]
+    return _run_worker("Sidon", cmd, out, work / "sidon.log", progress)
 
 
 def _denoise(raw: Path, work: Path, opts: EnhanceOptions, log: Callable[[str], None],
@@ -301,6 +338,9 @@ def _denoise(raw: Path, work: Path, opts: EnhanceOptions, log: Callable[[str], N
         return clean, (f"resemble-enhance (tau={rs.tau:g}, nfe={int(rs.nfe)}, lambd={rs.lambd:g}, "
                        f"solver={rs.solver}, seed={int(rs.seed)}, cpu)")
 
+    if denoiser == "sidon":
+        return _sidon(raw, work, progress), "sidon v0.1 (w2v-BERT 2.0 + DAC decoder, cpu)"
+
     if denoiser == "afftdn":
         clean = work / "clean.wav"
         _ffmpeg("-i", str(raw), "-af", AFFTDN_FALLBACK, "-c:a", "pcm_f32le", str(clean))
@@ -312,8 +352,10 @@ def _denoise(raw: Path, work: Path, opts: EnhanceOptions, log: Callable[[str], N
     raise PipelineError(f"Unknown denoiser: {opts.denoiser}")
 
 
-# Where each of the 5 stages starts in the overall progress; Resemble's denoise takes nearly all of it
-STAGES = {"resemble": [0.0, 0.02, 0.92, 0.95, 0.98], "other": [0.0, 0.15, 0.45, 0.65, 0.9]}
+# Where each of the 5 stages starts in the overall progress; Resemble's denoise takes nearly all of it,
+# Sidon's most of it (it runs at ~0.45× the recording's length)
+STAGES = {"resemble": [0.0, 0.02, 0.92, 0.95, 0.98], "sidon": [0.0, 0.05, 0.8, 0.88, 0.95],
+          "other": [0.0, 0.15, 0.45, 0.65, 0.9]}
 
 
 def enhance(src: Path, opts: EnhanceOptions | None = None, log: Callable[[str], None] = print,
@@ -332,7 +374,7 @@ def enhance(src: Path, opts: EnhanceOptions | None = None, log: Callable[[str], 
         opts.resemble.validate()
     dsp = PRESETS[opts.preset]
     started = datetime.now()
-    starts = STAGES["resemble" if opts.denoiser == "resemble" else "other"]
+    starts = STAGES.get(opts.denoiser, STAGES["other"])
     report = progress or (lambda _: None)
 
     def stage(i: int, msg: str) -> None:

@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from .pipeline import EnhanceOptions, enhance, find_resemble, resolve_outputs
+from .pipeline import EnhanceOptions, enhance, find_resemble, find_sidon, resolve_outputs
 
 # (file name, description, option changes) — all at the same target loudness, WAV
 VARIANTS = [
@@ -21,6 +21,7 @@ VARIANTS = [
 # Only when installed (scripts/install_resemble.sh); slow — a few times the recording's length
 RESEMBLE_VARIANT = ("6_resemble", "Resemble Enhance, full (default settings), no EQ",
                     dict(denoiser="resemble", preset="flat"))
+SIDON_VARIANT = ("7_sidon", "Sidon (generative restoration, 48 kHz), no EQ", dict(denoiser="sidon", preset="flat"))
 
 
 def compare(src: Path, base: EnhanceOptions | None = None, log: Callable[[str], None] = print) -> Path:
@@ -31,7 +32,7 @@ def compare(src: Path, base: EnhanceOptions | None = None, log: Callable[[str], 
     out_dir.mkdir(parents=True)
 
     lines = [f"Source: {src}", f"Target: {base.target_i} LUFS (all variants loudness-matched)", ""]
-    variants = VARIANTS + ([RESEMBLE_VARIANT] if find_resemble() else [])
+    variants = VARIANTS + ([RESEMBLE_VARIANT] if find_resemble() else []) + ([SIDON_VARIANT] if find_sidon() else [])
     for name, desc, changes in variants:
         log(f"  • {name}: {desc}")
         r = enhance(src, replace(base, **changes), log=lambda _: None, out=out_dir / f"{name}.wav")

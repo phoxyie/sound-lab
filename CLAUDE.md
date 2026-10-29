@@ -17,14 +17,16 @@ node --check soundlab/web/app.js           # quick JS syntax check
 ```
 
 `deep-filter` lives in `tools/` (`scripts/install_deepfilter.sh`); without it the pipeline falls back to ffmpeg `afftdn`.
-Optional Resemble Enhance: own venv `tools/resemble-venv` + weights `tools/resemble-model`
-(`scripts/install_resemble.sh`, pinned versions + checksums); `soundlab doctor` shows whether it's there.
+Optional generative denoisers, each with its own venv + model files under `tools/` (pinned versions +
+checksums): Resemble Enhance (`scripts/install_resemble.sh`) and Sidon (`scripts/install_sidon.sh`);
+`soundlab doctor` shows which are there.
 
 ## Layout
 
 - `soundlab/pipeline.py` — enhance pipeline (HPF → denoise → DSP preset → gain+limiter → linear loudnorm)
-- `soundlab/resemble_worker.py` — runs Resemble Enhance in its own venv's Python (subprocess, JSON progress
-  lines on stdout); never imported by soundlab, which has no torch
+- `soundlab/resemble_worker.py`, `soundlab/sidon_worker.py` — run Resemble Enhance / Sidon in their own
+  venv's Python (`pipeline._run_worker`: subprocess, JSON progress lines on stdout, offline env); never
+  imported by soundlab, which has no torch
 - `soundlab/editor.py` — trim (`atrim`) / speed (`atempo`) / join (`concat`) render + export
 - `soundlab/projects.py` — projects; `soundlab/recorder.py` — mic recording via CoreAudio (`sounddevice`)
 - `soundlab/gui.py` — Flask API, bound to 127.0.0.1 only; `soundlab/web/` — single-page frontend
@@ -54,6 +56,7 @@ Optional Resemble Enhance: own venv `tools/resemble-venv` + weights `tools/resem
   `SOUNDLAB_TRASH` / `SOUNDLAB_REVEAL_CMD`, and never record from the mic or touch the user's
   projects or real Trash. Recording runs on a generated real-time tone via
   `SOUNDLAB_RECORD_INPUT=tone:<Hz>` (same recorder code, only the source differs). It restores `projects/.current` at the end.
+  `SOUNDLAB_RESEMBLE_CONFIRM_SEC=1` makes every Resemble job show its duration dialog (default 60 s).
 - Audio claims ("sounds the same", "no click") are checked by rendering and comparing samples, not
   assumed — e.g. two continuous halves of a take only render identically because
   `editor.merge_continuous` joins them.
@@ -91,5 +94,9 @@ Optional Resemble Enhance: own venv `tools/resemble-venv` + weights `tools/resem
   and compare settings at the same seed. Its solver steps are staticmethods (the progress hook wraps
   them as such). `deepspeed` must be installed although inference never uses it (imported at load).
   The first progress line can take ~20 s, so `_resemble` polls for cancel instead of blocking on stdout.
+- Sidon: only CPU / CUDA TorchScript exports exist; the CPU one fails on MPS (device baked in). It
+  hears a 16 kHz copy, so everything above 8 kHz is generated. Its feature extractor settings come from
+  `facebook/w2v-bert-2.0` — kept in `tools/sidon-model` and loaded with `HF_HUB_OFFLINE`, otherwise
+  `from_pretrained` queries the Hub on every run. torch 2.15 needs Python 3.11+.
 - Enhancement reports keep absolute paths; after a project rename they're re-based on where the
   output lives now (`gui._report_clips`).
