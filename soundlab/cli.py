@@ -9,9 +9,23 @@ from pathlib import Path
 
 from . import projects
 from .compare import compare
-from .pipeline import CODECS, EnhanceOptions, PipelineError, enhance, find_deep_filter
+from .pipeline import (CODECS, DENOISERS, RESEMBLE_SOLVERS, EnhanceOptions, PipelineError, ResembleSettings,
+                       enhance, find_deep_filter, find_resemble)
 from .presets import PRESETS
 from .recorder import list_audio_devices, record
+
+
+def _progress_printer():
+    """Overall percentage on one line while a slow (Resemble) enhancement runs, if stdout is a terminal."""
+    last = [-1]
+
+    def show(f: float) -> None:
+        pct = int(f * 100)
+        if pct != last[0]:
+            last[0] = pct
+            print(f"\r    {pct:3d}%", end="\n" if pct >= 100 else "", flush=True)
+
+    return show if sys.stdout.isatty() else None
 
 
 def cmd_enhance(args: argparse.Namespace) -> int:
@@ -19,6 +33,7 @@ def cmd_enhance(args: argparse.Namespace) -> int:
         preset=args.preset,
         denoiser=args.denoiser,
         atten_lim_db=args.atten,
+        resemble=ResembleSettings(tau=args.tau, nfe=args.nfe, lambd=args.lambd, solver=args.solver, seed=args.seed),
         target_i=args.target,
         fmt=args.format,
         outputs_root=args.outputs,
@@ -27,7 +42,7 @@ def cmd_enhance(args: argparse.Namespace) -> int:
     for f in args.files:
         print(f"▶ {f}")
         try:
-            r = enhance(Path(f), opts)
+            r = enhance(Path(f), opts, progress=_progress_printer() if opts.denoiser == "resemble" else None)
         except PipelineError as e:
             print(f"  ✗ {e}", file=sys.stderr)
             failed += 1
@@ -103,6 +118,9 @@ def cmd_doctor(_: argparse.Namespace) -> int:
                        ("deep-filter", find_deep_filter())]:
         print(f"{'✓' if path else '✗'} {name}: {path or 'not found'}")
         ok &= bool(path) or name == "deep-filter"
+    resemble = find_resemble()  # optional
+    print(f"{'✓' if resemble else '–'} Resemble Enhance (optional): "
+          f"{resemble or 'not installed — ./scripts/install_resemble.sh'}")
     try:
         mics = list_audio_devices()
         print(f"✓ sounddevice (recording): {', '.join(mics) or 'no input device'}")
@@ -119,8 +137,17 @@ def main(argv: list[str] | None = None) -> int:
     # enhance and record --enhance share the same enhancement options
     enhance_opts = argparse.ArgumentParser(add_help=False)
     enhance_opts.add_argument("--preset", choices=list(PRESETS), default=EnhanceOptions.preset)
-    enhance_opts.add_argument("--denoiser", choices=["auto", "deepfilter", "afftdn", "none"], default="auto")
+    enhance_opts.add_argument("--denoiser", choices=DENOISERS, default="auto",
+                              help="resemble: Resemble Enhance (slow, CPU; generative voice rebuild)")
     enhance_opts.add_argument("--atten", type=float, default=30.0, help="DeepFilterNet max suppression (dB)")
+    rs = ResembleSettings()
+    enhance_opts.add_argument("--tau", type=float, default=rs.tau,
+                              help="Resemble temperature 0–1: lower stays closer to the input")
+    enhance_opts.add_argument("--nfe", type=int, default=rs.nfe, help="Resemble steps 1–128: fewer = faster")
+    enhance_opts.add_argument("--lambd", type=float, default=rs.lambd, help="Resemble denoise strength 0–1")
+    enhance_opts.add_argument("--solver", choices=RESEMBLE_SOLVERS, default=rs.solver)
+    enhance_opts.add_argument("--seed", type=int, default=rs.seed,
+                              help="Resemble variation 0–9999: each gives a slightly different result")
     enhance_opts.add_argument("--target", type=float, default=-16.0, help="Target loudness (LUFS); -14 for social media")
     enhance_opts.add_argument("--format", choices=list(CODECS), default="m4a")
     enhance_opts.add_argument("--outputs", type=Path, help="Default: the current project's outputs/ folder")

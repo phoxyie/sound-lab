@@ -5,7 +5,8 @@ new track → multi-track editor (up to 33 tracks): scrub inside the trim range 
 the playhead can't leave the trim range, I/O trim, speed, preview, replace a track, resize a track,
 close tracks → timeline: drag in, reorder, edit a clip from its card and update it, play with a
 moving cursor, seek on the ruler → enhance → A/B
-original ↔ enhanced → "already enhanced" warning → join & export → timeline survives
+original ↔ enhanced → "already enhanced" warning → Resemble Enhance (settings, progress, report,
+cancel; if installed) → join & export → timeline survives
 a reload → Show in Finder → record (3-2-1, level meter, named take, cancel) → move to Trash → project isolation →
 rename → delete the project.
 
@@ -139,8 +140,90 @@ def step(msg: str) -> None:
     print(f"  ✓ {msg}", flush=True)
 
 
+def set_range(page: Page, sel: str, value: float) -> None:
+    page.locator(sel).evaluate("(s, v) => { s.value = v; for (const t of ['input', 'change']) "
+                               "s.dispatchEvent(new Event(t, { bubbles: true })); }", value)
+
+
+def workers(server_pid: int) -> list[str]:
+    """Resemble worker processes started by the test's GUI server."""
+    r = subprocess.run(["pgrep", "-P", str(server_pid), "-f", "resemble_worker.py"], capture_output=True, text=True)
+    return r.stdout.split()
+
+
+def resemble_steps(page: Page, shots: Path, lanes: Locator, outputs: Path, server_pid: int) -> None:
+    page.locator("#denoiser").select_option("resemble")
+    expect(page.locator("#toast")).to_contain_text("Resemble Enhance: rebuilds the voice")
+    hide_toast(page)
+    panel, gear = page.locator("#resemble-panel"), page.locator("#resemble-btn")
+    expect(gear).to_have_text("⚙ Settings")
+    gear.click()
+    expect(panel).to_be_visible()
+    expect(page.locator("#rs-tau-val")).to_have_text("0.50")  # the ear-tested defaults
+    expect(page.locator("#rs-nfe")).to_have_value("32")
+    expect(page.locator("#rs-solver")).to_have_value("midpoint")
+    # Tune: lower temperature, few steps (fast), another variation
+    set_range(page, "#rs-tau", 0.3)
+    expect(page.locator("#rs-tau-val")).to_have_text("0.30")
+    page.locator("#rs-nfe").select_option("8")
+    page.locator("#rs-seed").fill("7")
+    page.locator("#rs-seed").dispatch_event("change")
+    expect(gear).to_have_text("⚙ Settings •")  # changed from the defaults
+    page.screenshot(path=str(shots / "3_resemble_settings.png"))
+    page.keyboard.press("Escape")
+    expect(panel).to_be_hidden()
+    tuned = {"tau": 0.3, "lambd": 1, "nfe": 8, "solver": "midpoint", "seed": 7}
+    saved = page.evaluate("JSON.parse(localStorage.getItem('soundlab.enhance'))")
+    assert saved == {"denoiser": "resemble", "resemble": tuned}, saved
+    step("Resemble settings: defaults tau 0.5 / nfe 32, tuned + saved, popover closes on Escape")
+
+    # Enhance with Resemble: progress on the button, the settings end up in the report
+    lane = lanes.nth(0)
+    btn = lane.locator(".lane-enhance")
+    expected = parse_time(lane.locator(".lane-chip-dur").inner_text())
+    count = lanes.count()
+    btn.click()
+    expect(btn).to_have_text(re.compile(r"^\d+% · Cancel$"), timeout=10_000)
+    page.screenshot(path=str(shots / "3_resemble_progress.png"))
+    out = toast_path(page, "Enhanced")
+    expect(btn).to_have_text("✨ Enhance")
+    report = json.loads(out.with_suffix(".json").read_text())
+    assert "_resemble_" in out.name, out  # edit_resemble_HHMMSS (the track is trimmed)
+    assert report["options"]["denoiser"] == "resemble" and report["options"]["resemble"] == tuned, report["options"]
+    assert report["denoiser"].startswith("resemble-enhance (tau=0.3, nfe=8, lambd=1, solver=midpoint, seed=7"), report
+    assert report["normalization_type"] == "linear", report["normalization_type"]
+    got = duration(out)
+    assert abs(got - expected) < 0.1, (got, expected)  # the chip shows 0.1 s
+    expect(lanes).to_have_count(count + 1)
+    lanes.nth(1).locator(".lane-close").click()
+    expect(lanes).to_have_count(count)
+    step(f"Resemble enhance: {out.name} ({got:.2f}s), settings in its report, {report['elapsed_sec']}s")
+
+    # A second click cancels: no output, and the worker process is gone
+    before = sorted(outputs.rglob("*.*"))
+    btn.click()
+    expect(btn).to_have_text(re.compile(r"% · Cancel$"))
+    deadline = time.monotonic() + 15
+    while not workers(server_pid):
+        assert time.monotonic() < deadline, "the Resemble worker didn't start"
+        time.sleep(0.1)
+    btn.click()
+    expect(page.locator("#toast")).to_contain_text("Enhance cancelled", timeout=30_000)
+    expect(btn).to_have_text("✨ Enhance")
+    deadline = time.monotonic() + 5
+    while workers(server_pid):
+        assert time.monotonic() < deadline, "the Resemble worker is still running after cancel"
+        time.sleep(0.1)
+    assert sorted(outputs.rglob("*.*")) == before
+    hide_toast(page)
+    step("Resemble enhance cancelled: worker stopped, no output written")
+
+    page.locator("#denoiser").select_option("auto")
+    expect(gear).to_be_hidden()
+
+
 def run(page: Page, base: str, shots: Path, fixtures: list[Path], trash: Path,
-        project: str, original: str) -> None:
+        project: str, original: str, server_pid: int) -> None:
     errors: list[str] = []
     page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
     page.on("console", lambda m: m.type == "error" and errors.append(f"console: {m.text}"))
@@ -607,6 +690,14 @@ def run(page: Page, base: str, shots: Path, fixtures: list[Path], trash: Path,
     expect(page.locator("#enhance-warn")).to_be_hidden()
     step("'already enhanced' warning shown / hidden")
 
+    # Resemble Enhance (optional install): settings popover, a job with progress, its report, cancel
+    from soundlab.pipeline import find_resemble
+    if not find_resemble():
+        expect(page.locator('#denoiser option[value="resemble"]')).to_be_disabled()
+        step("Resemble Enhance not installed: its option is disabled (steps skipped)")
+    else:
+        resemble_steps(page, shots, lanes, ROOT / "projects" / project / "outputs", server_pid)
+
     # Join & export — expected length = sum of cards
     expected = parse_time(page.locator("#total").inner_text())
     page.locator("#export").click()
@@ -749,7 +840,7 @@ def main() -> int:
             browser = p.webkit.launch(headless=not args.headed)
             page = browser.new_page(viewport={"width": 1400, "height": 900})
             try:
-                run(page, base, args.shots, fixtures, trash, project, original)
+                run(page, base, args.shots, fixtures, trash, project, original, server.pid)
             except Exception:
                 page.screenshot(path=str(args.shots / "failure.png"))
                 raise

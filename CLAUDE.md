@@ -17,14 +17,20 @@ node --check soundlab/web/app.js           # quick JS syntax check
 ```
 
 `deep-filter` lives in `tools/` (`scripts/install_deepfilter.sh`); without it the pipeline falls back to ffmpeg `afftdn`.
+Optional Resemble Enhance: own venv `tools/resemble-venv` + weights `tools/resemble-model`
+(`scripts/install_resemble.sh`, pinned versions + checksums); `soundlab doctor` shows whether it's there.
 
 ## Layout
 
 - `soundlab/pipeline.py` — enhance pipeline (HPF → denoise → DSP preset → gain+limiter → linear loudnorm)
+- `soundlab/resemble_worker.py` — runs Resemble Enhance in its own venv's Python (subprocess, JSON progress
+  lines on stdout); never imported by soundlab, which has no torch
 - `soundlab/editor.py` — trim (`atrim`) / speed (`atempo`) / join (`concat`) render + export
 - `soundlab/projects.py` — projects; `soundlab/recorder.py` — mic recording via CoreAudio (`sounddevice`)
 - `soundlab/gui.py` — Flask API, bound to 127.0.0.1 only; `soundlab/web/` — single-page frontend
-  (`app.js`, wavesurfer.js vendored in `web/vendor/`, no build step)
+  (`app.js`, wavesurfer.js vendored in `web/vendor/`, no build step). Enhance / export are background
+  jobs (`/api/jobs/<id>`, cancel via `/cancel`): the pipeline's `progress` callback reports 0–1 and raises
+  `Cancelled` once the job is cancelled.
 - Data: `projects/<name>/{inputs,outputs,voice-records}`, current project in `projects/.current`
   (shared by CLI and GUI). The GUI timeline lives in the browser's `localStorage`, keyed by project
   name, with clip paths that include the project folder — renaming must migrate both (GUI rename
@@ -38,7 +44,8 @@ node --check soundlab/web/app.js           # quick JS syntax check
 - Edits are non-destructive: source files are never modified; trim/speed apply only on render.
 - Deleting = moving to the Trash (`SOUNDLAB_TRASH` overrides the folder), never `rm`.
 - Default enhancement is preset `flat` with full DeepFilterNet — chosen by the user's ear test;
-  don't change defaults without an A/B (`soundlab compare`).
+  don't change defaults without an A/B (`soundlab compare`). Resemble's defaults (tau 0.5, nfe 32,
+  lambd 1.0, midpoint, seed 0) come from an ear-tested settings grid too.
 
 ## Testing rules
 
@@ -78,5 +85,11 @@ node --check soundlab/web/app.js           # quick JS syntax check
   voice and leaves 0.05 s gaps (jump cuts — the user wants continuous speech, no breathing room). Check Tighten changes on the user's real takes: the output
   must keep > 99.5% of the source's energy (cutting a syllable costs several %); counting loud 20 ms
   windows is misleading because cuts shift the window grid.
+- Resemble Enhance: full enhance crashes on MPS (abort after minutes) → CPU only. Its denoise-only mode
+  passed the user's room noise through untouched. It's generative: the seed changes the result about as
+  much as `tau` does, so seed after the model load (which consumes the RNG) to keep a seed reproducible,
+  and compare settings at the same seed. Its solver steps are staticmethods (the progress hook wraps
+  them as such). `deepspeed` must be installed although inference never uses it (imported at load).
+  The first progress line can take ~20 s, so `_resemble` polls for cancel instead of blocking on stdout.
 - Enhancement reports keep absolute paths; after a project rename they're re-based on where the
   output lives now (`gui._report_clips`).

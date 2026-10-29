@@ -10,6 +10,9 @@ const COLLAPSE_KEY = "soundlab.collapsed";
 const COUNTDOWN_KEY = "soundlab.countdown";
 const COUNTDOWN_SEC = 3;
 const TIGHTEN_KEY = "soundlab.tightenPause";
+const ENHANCE_KEY = "soundlab.enhance"; // denoiser choice + Resemble settings
+const NFE_CHOICES = [8, 16, 32, 64, 128];
+const JOB_POLL_MS = 300;
 // Automated tests open the page with ?mute=1 so previews don't play through the speakers
 const MUTED = new URLSearchParams(location.search).has("mute");
 const MAX_LANES = 33;
@@ -58,6 +61,24 @@ function toast(msg, kind = "ok", ms = 4000, actions = []) {
 }
 
 const reportError = (e) => toast(e.message, "error", 6000);
+
+// Enhance / export run as server jobs: start one, then poll its progress until it ends.
+// onProgress gets {id, progress 0–1, elapsed} — first right after the start, so the caller can cancel.
+async function runJob(path, body, onProgress) {
+  const { job } = await api(path, body);
+  onProgress?.({ id: job, progress: 0, elapsed: 0 });
+  for (;;) {
+    await new Promise((r) => setTimeout(r, JOB_POLL_MS));
+    const j = await api(`/api/jobs/${job}`);
+    if (j.status === "done") return j.result;
+    if (j.status === "error") throw new Error(j.error);
+    if (j.status === "cancelled") throw Object.assign(new Error("Cancelled"), { cancelled: true });
+    onProgress?.(j);
+  }
+}
+
+const cancelJob = (id) => api(`/api/jobs/${id}/cancel`, {}).catch(reportError);
+const busyLabel = (j) => `${Math.round(j.progress * 100)}% · Cancel`;
 
 async function api(path, body) {
   const res = await fetch(path, body === undefined ? {} : {
@@ -359,9 +380,80 @@ async function initConfig() {
   for (const p of cfg.presets) sel.append(new Option(p === cfg.default_preset ? `${p} (default)` : p, p));
   sel.value = cfg.default_preset;
   $("target").value = String(cfg.default_target);
+  initResemble(cfg.resemble);
 }
 
-const enhanceSettings = () => ({ preset: $("preset").value, target: Number($("target").value), format: $("format").value });
+// ---------- Resemble Enhance settings (denoiser choice + tuning, kept in localStorage) ----------
+
+const resemble = { defaults: null, installed: false };
+
+function initResemble(info) {
+  resemble.defaults = info.defaults;
+  resemble.installed = info.installed;
+  const opt = $("denoiser").querySelector('option[value="resemble"]');
+  opt.disabled = !info.installed;
+  if (!info.installed) {
+    opt.textContent = "Resemble Enhance (not installed)";
+    opt.title = "./scripts/install_resemble.sh";
+  }
+  for (const s of info.solvers) $("rs-solver").append(new Option(s === info.defaults.solver ? `${s} (default)` : s, s));
+  $("rs-seed").max = info.seed_max;
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(ENHANCE_KEY)) || {}; } catch { /* ignore */ }
+  $("denoiser").value = info.installed && saved.denoiser === "resemble" ? "resemble" : "auto";
+  setResembleFields({ ...info.defaults, ...(saved.resemble || {}) });
+  updateDenoiserUI();
+}
+
+function setResembleFields(v) {
+  $("rs-tau").value = v.tau;
+  $("rs-lambd").value = v.lambd;
+  const nfe = $("rs-nfe");
+  nfe.replaceChildren(...[...new Set([...NFE_CHOICES, Number(v.nfe)])].sort((a, b) => a - b).map((n) => new Option(
+    `${n}${n === resemble.defaults.nfe ? " (default)" : ""}`, n)));
+  nfe.value = String(v.nfe);
+  $("rs-solver").value = v.solver;
+  $("rs-seed").value = v.seed;
+  updateResembleValues();
+}
+
+function resembleSettings() {
+  const seed = Math.round(Number($("rs-seed").value));
+  return {
+    tau: Number($("rs-tau").value),
+    lambd: Number($("rs-lambd").value),
+    nfe: Number($("rs-nfe").value),
+    solver: $("rs-solver").value,
+    seed: Number.isFinite(seed) ? Math.min(Math.max(seed, 0), Number($("rs-seed").max)) : resemble.defaults.seed,
+  };
+}
+
+function updateResembleValues() {
+  $("rs-tau-val").textContent = Number($("rs-tau").value).toFixed(2);
+  $("rs-lambd-val").textContent = Number($("rs-lambd").value).toFixed(2);
+}
+
+function saveEnhanceSettings() {
+  try {
+    localStorage.setItem(ENHANCE_KEY, JSON.stringify({ denoiser: $("denoiser").value, resemble: resembleSettings() }));
+  } catch { /* ignore */ }
+}
+
+function updateDenoiserUI() {
+  const on = $("denoiser").value === "resemble";
+  $("resemble-btn").classList.toggle("hidden", !on);
+  if (!on) $("resemble-panel").classList.add("hidden");
+  const d = resemble.defaults;
+  const v = resembleSettings();
+  const changed = d && ["tau", "lambd", "nfe", "solver", "seed"].some((k) => v[k] !== d[k]);
+  $("resemble-btn").textContent = changed ? "⚙ Settings •" : "⚙ Settings";
+  $("resemble-btn").title = `Resemble Enhance settings${changed ? " (changed from the defaults)" : ""}`;
+}
+
+const enhanceSettings = () => ({
+  preset: $("preset").value, target: Number($("target").value), format: $("format").value,
+  denoiser: $("denoiser").value, resemble: resembleSettings(),
+});
 
 function resultMessage(verb, r) {
   const parts = [`${verb}: ${r.path}`, fmt(r.duration)];
@@ -983,12 +1075,20 @@ function clearEditing() {
 
 async function enhanceLane(lane) {
   if (!lane?.path) return;
+  if (lane.job) { cancelJob(lane.job); return; } // a second click while it runs cancels it
+  if (lane.enhancing) return; // starting
   const btn = lane.q(".lane-enhance");
-  btn.disabled = true;
+  const title = btn.title;
+  lane.enhancing = true;
+  btn.classList.add("busy");
   btn.textContent = "Processing…";
+  btn.title = "Click to cancel";
   try {
     const { path, start, end, speed } = laneClip(lane);
-    const r = await api("/api/enhance", { path, start, end, speed, ...enhanceSettings() });
+    const r = await runJob("/api/enhance", { path, start, end, speed, ...enhanceSettings() }, (j) => {
+      lane.job = j.id;
+      btn.textContent = busyLabel(j);
+    });
     await refreshLibrary(r.path);
     // like Tighten: the enhanced version opens right below; trim and speed are already in the file
     const f = findFile(r.path);
@@ -996,10 +1096,14 @@ async function enhanceLane(lane) {
     toast(resultMessage("Enhanced", r) + (added ? "" : " — the editor is full, it's in Exports"),
       added ? "ok" : "warn", 8000, [{ label: "Show in Finder", onClick: () => reveal(r.path) }]);
   } catch (e) {
-    reportError(e);
+    if (e.cancelled) toast("Enhance cancelled", "warn");
+    else reportError(e);
   } finally {
+    lane.job = null;
+    lane.enhancing = false;
+    btn.classList.remove("busy");
     btn.textContent = "✨ Enhance";
-    btn.disabled = false;
+    btn.title = title;
   }
 }
 
@@ -1233,25 +1337,74 @@ $("clear-timeline").addEventListener("click", () => {
   renderTimeline();
 });
 
+const exporting = { job: null, starting: false };
+
 $("export").addEventListener("click", async () => {
+  if (exporting.job) { cancelJob(exporting.job); return; } // a second click while it runs cancels it
+  if (exporting.starting) return;
   const btn = $("export");
-  btn.disabled = true;
+  exporting.starting = true;
+  btn.classList.add("busy");
   btn.textContent = "Processing…";
+  btn.title = "Click to cancel";
   try {
-    const r = await api("/api/export", {
+    const r = await runJob("/api/export", {
       clips: state.timeline.map(({ path, start, end, speed }) => ({ path, start, end, speed })),
       enhance: $("enhance").checked,
       ...enhanceSettings(),
+    }, (j) => {
+      exporting.job = j.id;
+      btn.textContent = busyLabel(j);
     });
     await refreshLibrary(r.path);
     toast(resultMessage("Exported", r), "ok", 8000, resultActions(r.path));
   } catch (e) {
-    reportError(e);
+    if (e.cancelled) toast("Export cancelled", "warn");
+    else reportError(e);
   } finally {
+    exporting.job = null;
+    exporting.starting = false;
+    btn.classList.remove("busy");
     btn.textContent = "Join & Export";
+    btn.title = "";
     btn.disabled = state.timeline.length === 0;
   }
 });
+
+// Resemble settings popover
+$("denoiser").addEventListener("change", () => {
+  saveEnhanceSettings();
+  updateDenoiserUI();
+  if ($("denoiser").value === "resemble") {
+    toast("Resemble Enhance: rebuilds the voice and runs on the CPU — about 3–4× the recording's length. "
+      + "Tune it under ⚙ Settings.", "ok", 6000);
+  }
+});
+$("resemble-btn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  $("resemble-panel").classList.toggle("hidden");
+});
+$("resemble-panel").addEventListener("click", (e) => e.stopPropagation());
+document.addEventListener("click", () => $("resemble-panel").classList.add("hidden"));
+for (const id of ["rs-tau", "rs-lambd", "rs-nfe", "rs-solver", "rs-seed"]) {
+  $(id).addEventListener("input", () => { updateResembleValues(); updateDenoiserUI(); });
+  $(id).addEventListener("change", () => {
+    if (id === "rs-seed") $("rs-seed").value = resembleSettings().seed; // clamp typed values
+    saveEnhanceSettings();
+    updateDenoiserUI();
+  });
+}
+$("rs-roll").addEventListener("click", () => {
+  $("rs-seed").value = Math.floor(Math.random() * (Number($("rs-seed").max) + 1));
+  saveEnhanceSettings();
+  updateDenoiserUI();
+});
+$("rs-reset").addEventListener("click", () => {
+  setResembleFields(resemble.defaults);
+  saveEnhanceSettings();
+  updateDenoiserUI();
+});
+$("rs-done").addEventListener("click", () => $("resemble-panel").classList.add("hidden"));
 
 // ---------- timeline playback ----------
 
@@ -1443,6 +1596,10 @@ $("filter").addEventListener("input", () => renderLibrary());
 // ← / → move its playhead (⇧ 100 ms, ⌥ 1 ms, else 10 ms);
 // + / − / 0 zoom it in / out / to fit
 document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("resemble-panel").classList.contains("hidden")) {
+    $("resemble-panel").classList.add("hidden");
+    return;
+  }
   if (e.target.matches("input, select, textarea")) return; // fields and sliders keep their own keys
   const lane = state.activeLane;
   if (state.focus === "lane" && !e.metaKey && !e.ctrlKey && lane?.region) {

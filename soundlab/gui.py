@@ -13,16 +13,22 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
+import uuid
 import webbrowser
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 from werkzeug.serving import make_server
 
 from . import projects
 from .editor import PAUSE_MAX, Clip, export_timeline, extract, keep_segments, render, tighten
-from .pipeline import CODECS, PROJECT_ROOT, EnhanceOptions, PipelineError, _ffmpeg, enhance, measure_loudness
+from .pipeline import (CODECS, PROJECT_ROOT, RESEMBLE_NFE_MAX, RESEMBLE_SEED_MAX, RESEMBLE_SOLVERS, Cancelled,
+                       EnhanceOptions, PipelineError, Progress, ResembleSettings, _ffmpeg, enhance, find_resemble,
+                       measure_loudness)
 from .presets import PRESETS
 from .recorder import Recorder, list_audio_devices, pick_device
 
@@ -39,6 +45,8 @@ TARGET_MIN, TARGET_MAX = -30.0, -9.0
 # Timeline previews: one WAV with trim/speed applied (no enhancement), cached by a content hash
 PREVIEW_DIR = Path(tempfile.gettempdir()) / "soundlab-preview"
 PREVIEW_KEEP = 20
+JOBS_KEEP = 20  # finished jobs kept for status polling
+GUI_DENOISERS = ["auto", "resemble"]  # auto = DeepFilterNet (afftdn if it's missing)
 
 app = Flask(__name__, static_folder=str(WEB_DIR), static_url_path="/static")
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024**3  # import size limit: 2 GB
@@ -46,6 +54,9 @@ recorder = Recorder()
 _lock = threading.Lock()
 _preview_lock = threading.Lock()
 _duration_cache: dict[tuple[str, float], float] = {}
+# Enhance / export run as background jobs (Resemble takes minutes): the browser polls /api/jobs/<id>
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
 
 
 def _rel(p: Path) -> str:
@@ -305,7 +316,22 @@ def record_cancel():
 @app.get("/api/config")
 def config():
     return jsonify(presets=list(PRESETS), default_preset=EnhanceOptions.preset,
-                   default_target=EnhanceOptions.target_i, formats=list(CODECS))
+                   default_target=EnhanceOptions.target_i, formats=list(CODECS),
+                   resemble={"installed": find_resemble() is not None, "defaults": asdict(ResembleSettings()),
+                             "solvers": RESEMBLE_SOLVERS, "nfe_max": RESEMBLE_NFE_MAX, "seed_max": RESEMBLE_SEED_MAX})
+
+
+def _resemble_settings(raw: dict | None) -> ResembleSettings:
+    d = ResembleSettings()
+    raw = raw or {}
+    try:
+        rs = ResembleSettings(tau=float(raw.get("tau", d.tau)), nfe=int(raw.get("nfe", d.nfe)),
+                              lambd=float(raw.get("lambd", d.lambd)), solver=str(raw.get("solver", d.solver)),
+                              seed=int(raw.get("seed", d.seed)))
+    except (TypeError, ValueError):
+        raise PipelineError("Invalid Resemble settings") from None
+    rs.validate()
+    return rs
 
 
 def _enhance_options(body: dict) -> EnhanceOptions:
@@ -318,7 +344,64 @@ def _enhance_options(body: dict) -> EnhanceOptions:
     target = float(body.get("target", EnhanceOptions.target_i))
     if not (TARGET_MIN <= target <= TARGET_MAX):
         raise PipelineError(f"Target loudness must be between {TARGET_MIN} and {TARGET_MAX} LUFS")
-    return EnhanceOptions(preset=preset, target_i=target, fmt=fmt, outputs_root=projects.current().outputs)
+    denoiser = body.get("denoiser", "auto")
+    if denoiser not in GUI_DENOISERS:
+        raise PipelineError(f"Unknown denoiser: {denoiser}")
+    if denoiser == "resemble" and not find_resemble():
+        raise PipelineError("Resemble Enhance isn't installed: run ./scripts/install_resemble.sh")
+    return EnhanceOptions(preset=preset, target_i=target, fmt=fmt, outputs_root=projects.current().outputs,
+                          denoiser=denoiser, resemble=_resemble_settings(body.get("resemble")))
+
+
+def _start_job(work: Callable[[Progress], dict]) -> str:
+    """Runs work(progress) in a thread; progress raises Cancelled once the job is cancelled."""
+    job = {"id": uuid.uuid4().hex[:12], "status": "running", "progress": 0.0, "result": None, "error": None,
+           "started": time.monotonic(), "cancel": threading.Event()}
+
+    def progress(f: float) -> None:
+        if job["cancel"].is_set() and f < 1:  # at 1 the output is written: let it finish
+            raise Cancelled("Cancelled")
+        job["progress"] = round(f, 3)
+
+    def run() -> None:
+        try:
+            job["result"] = work(progress)
+            job["progress"], job["status"] = 1.0, "done"
+        except Cancelled:
+            job["status"] = "cancelled"
+        except (PipelineError, projects.ProjectError) as e:
+            job["error"], job["status"] = str(e), "error"
+        except Exception as e:  # noqa: BLE001 — report it in the UI instead of a silently dead job
+            logging.getLogger(__name__).exception("job failed")
+            job["error"], job["status"] = f"Unexpected error: {e}", "error"
+
+    with _jobs_lock:
+        finished = [j for j in _jobs.values() if j["status"] != "running"]
+        for old in sorted(finished, key=lambda j: j["started"])[:-JOBS_KEEP]:
+            del _jobs[old["id"]]
+        _jobs[job["id"]] = job
+    threading.Thread(target=run, daemon=True).start()
+    return job["id"]
+
+
+def _job(job_id: str) -> dict:
+    job = _jobs.get(job_id)
+    if job is None:
+        abort(404)
+    return job
+
+
+@app.get("/api/jobs/<job_id>")
+def job_status(job_id: str):
+    job = _job(job_id)
+    return jsonify(id=job["id"], status=job["status"], progress=job["progress"], result=job["result"],
+                   error=job["error"], elapsed=round(time.monotonic() - job["started"], 1))
+
+
+@app.post("/api/jobs/<job_id>/cancel")
+def job_cancel(job_id: str):
+    _job(job_id)["cancel"].set()
+    return jsonify(ok=True)
 
 
 def _result(data: dict) -> dict:
@@ -334,7 +417,7 @@ def _result(data: dict) -> dict:
 
 @app.post("/api/enhance")
 def enhance_file():
-    """Enhances one file; only the selected range if trim/speed were changed."""
+    """Starts enhancing one file (only the selected range if trim/speed were changed); returns a job id."""
     body = request.get_json(force=True)
     src = _resolve_media(body.get("path", ""))
     opts = _enhance_options(body)
@@ -343,11 +426,16 @@ def enhance_file():
     duration = _duration(src) or 0
     end = duration if end is None else float(end)
     untouched = start <= 0.01 and end >= duration - 0.01 and abs(speed - 1) < 1e-3
-    if untouched:
-        data = enhance(src, opts, log=lambda _: None).data
-    else:
-        data = export_timeline([Clip(src, start, end, speed)], enhance_it=True, opts=opts, log=lambda _: None)
-    return jsonify(_result(data))
+
+    def work(progress: Progress) -> dict:
+        if untouched:
+            data = enhance(src, opts, log=lambda _: None, progress=progress).data
+        else:
+            data = export_timeline([Clip(src, start, end, speed)], enhance_it=True, opts=opts,
+                                   log=lambda _: None, progress=progress)
+        return _result(data)
+
+    return jsonify(job=_start_job(work))
 
 
 @app.post("/api/tighten")
@@ -496,10 +584,13 @@ def preview_file(name: str):
 
 @app.post("/api/export")
 def export():
+    """Starts joining (and enhancing) the timeline; returns a job id."""
     body = request.get_json(force=True)
-    data = export_timeline(_clips(body), enhance_it=bool(body.get("enhance", True)),
-                           opts=_enhance_options(body), log=lambda _: None)
-    return jsonify(_result(data))
+    clips, enhance_it, opts = _clips(body), bool(body.get("enhance", True)), _enhance_options(body)
+    if not clips:
+        raise PipelineError("The timeline is empty")
+    return jsonify(job=_start_job(lambda progress: _result(
+        export_timeline(clips, enhance_it=enhance_it, opts=opts, log=lambda _: None, progress=progress))))
 
 
 def run(port: int = 8765, open_browser: bool = True) -> None:

@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from .pipeline import EnhanceOptions, enhance, resolve_outputs
+from .pipeline import EnhanceOptions, enhance, find_resemble, resolve_outputs
 
 # (file name, description, option changes) — all at the same target loudness, WAV
 VARIANTS = [
@@ -18,6 +18,9 @@ VARIANTS = [
     ("4_default_voice-light", "default + light EQ/comp", dict(denoiser="deepfilter", preset="voice-light")),
     ("5_default_voice-a", "default + voice-a EQ/comp (old default)", dict(denoiser="deepfilter", preset="voice-a")),
 ]
+# Only when installed (scripts/install_resemble.sh); slow — a few times the recording's length
+RESEMBLE_VARIANT = ("6_resemble", "Resemble Enhance, full (default settings), no EQ",
+                    dict(denoiser="resemble", preset="flat"))
 
 
 def compare(src: Path, base: EnhanceOptions | None = None, log: Callable[[str], None] = print) -> Path:
@@ -28,7 +31,8 @@ def compare(src: Path, base: EnhanceOptions | None = None, log: Callable[[str], 
     out_dir.mkdir(parents=True)
 
     lines = [f"Source: {src}", f"Target: {base.target_i} LUFS (all variants loudness-matched)", ""]
-    for name, desc, changes in VARIANTS:
+    variants = VARIANTS + ([RESEMBLE_VARIANT] if find_resemble() else [])
+    for name, desc, changes in variants:
         log(f"  • {name}: {desc}")
         r = enhance(src, replace(base, **changes), log=lambda _: None, out=out_dir / f"{name}.wav")
         snr = r.data["noise_output"]["snr_db"]

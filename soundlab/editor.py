@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from .pipeline import (CODECS, RMS_WINDOW, SAMPLE_RATE, EnhanceOptions, PipelineError, _ffmpeg, enhance,
+from .pipeline import (CODECS, RMS_WINDOW, SAMPLE_RATE, EnhanceOptions, PipelineError, Progress, _ffmpeg, enhance,
                        noise_levels, probe_duration, resolve_outputs, rms_windows)
 
 SPEED_MIN, SPEED_MAX = 0.5, 2.0
@@ -274,11 +274,11 @@ def extract(src: Path, start: float, end: float, out_dir: Path) -> dict:
     return data
 
 
-def _export_path(root: Path, fmt: str) -> Path:
+def _export_path(root: Path, fmt: str, tag: str = "") -> Path:
     now = datetime.now()
     day_dir = root / now.strftime("%Y-%m-%d")
     day_dir.mkdir(parents=True, exist_ok=True)
-    base = f"edit_{now.strftime('%H%M%S')}"
+    base = f"edit_{tag}{now.strftime('%H%M%S')}"
     out = day_dir / f"{base}.{fmt}"
     n = 2
     while out.exists():
@@ -288,18 +288,18 @@ def _export_path(root: Path, fmt: str) -> Path:
 
 
 def export_timeline(clips: list[Clip], enhance_it: bool = True, opts: EnhanceOptions | None = None,
-                    log: Callable[[str], None] = print) -> dict:
+                    log: Callable[[str], None] = print, progress: Progress | None = None) -> dict:
     """Renders the timeline, enhancing it if asked; output + JSON report go to outputs/YYYY-MM-DD/."""
     opts = opts or EnhanceOptions()
     if opts.fmt not in CODECS:
         raise PipelineError(f"Unknown format: {opts.fmt}")
-    out = _export_path(resolve_outputs(opts), opts.fmt)
+    out = _export_path(resolve_outputs(opts), opts.fmt, "resemble_" if enhance_it and opts.denoiser == "resemble" else "")
 
     with tempfile.TemporaryDirectory(prefix="soundlab-edit-") as tmp:
         joined = Path(tmp) / "joined.wav"
         render(clips, joined, ["-c:a", "pcm_f32le"])
         if enhance_it:
-            data = enhance(joined, opts, log=log, out=out).data
+            data = enhance(joined, opts, log=log, out=out, progress=progress).data
             data["source"] = "timeline"
         else:
             _ffmpeg("-i", str(joined), *CODECS[opts.fmt], str(out))

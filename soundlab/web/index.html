@@ -61,6 +61,43 @@
         <h2>Editor</h2>
         <span id="track-count" class="muted mono">0/3</span>
         <div class="enhance-settings">
+          <select id="denoiser" title="Noise reduction (also used for export)">
+            <option value="auto">DeepFilterNet (default)</option>
+            <option value="resemble">Resemble Enhance</option>
+          </select>
+          <button id="resemble-btn" class="btn hidden" title="Resemble Enhance settings">⚙ Settings</button>
+          <div id="resemble-panel" class="popover hidden">
+            <h3>Resemble Enhance</h3>
+            <p class="pop-note">Rebuilds the voice (generative) — listen before you use it. Runs on the CPU:
+              about 3–4× the recording's length.</p>
+            <label class="pop-row" title="Prior temperature (tau): lower stays closer to the input, higher varies more. 0.5 sounded best on a real take.">
+              <span>Temperature</span>
+              <input id="rs-tau" type="range" min="0" max="1" step="0.05">
+              <span id="rs-tau-val" class="mono pop-val"></span>
+            </label>
+            <label class="pop-row" title="Denoise strength (lambd) before the voice is rebuilt">
+              <span>Strength</span>
+              <input id="rs-lambd" type="range" min="0" max="1" step="0.05">
+              <span id="rs-lambd-val" class="mono pop-val"></span>
+            </label>
+            <label class="pop-row" title="Solver function evaluations (nfe): fewer = faster, 32 and 64 sounded the same">
+              <span>Steps</span>
+              <select id="rs-nfe"></select>
+            </label>
+            <label class="pop-row" title="ODE solver: midpoint is the default, rk4 is slower, euler is the simplest">
+              <span>Solver</span>
+              <select id="rs-solver"></select>
+            </label>
+            <label class="pop-row" title="The rebuild starts from random noise: each number gives a slightly different result, the same number the same one">
+              <span>Variation</span>
+              <input id="rs-seed" class="mono" type="number" min="0" step="1">
+              <button id="rs-roll" class="btn" type="button" title="Pick a random variation">🎲</button>
+            </label>
+            <div class="pop-actions">
+              <button id="rs-reset" class="btn" type="button">Reset to defaults</button>
+              <button id="rs-done" class="btn primary" type="button">Done</button>
+            </div>
+          </div>
           <select id="preset" title="DSP preset (also used for export)"></select>
           <select id="target" title="Target loudness (also used for export)">
             <option value="-16">-16 LUFS</option>

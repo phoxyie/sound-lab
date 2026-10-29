@@ -21,15 +21,46 @@ Activate the environment in every new terminal with `source .venv/bin/activate`
 
 Without `deep-filter` the pipeline falls back to ffmpeg's `afftdn` denoiser automatically.
 
+Optional, **Resemble Enhance** (a second denoiser, see below; ~1.6 GB, needs Python 3.10 or 3.11):
+
+```bash
+./scripts/install_resemble.sh        # own venv → tools/resemble-venv, weights → tools/resemble-model
+```
+
 ## Usage
 
 ```bash
 soundlab enhance take.m4a                       # default: -16 LUFS, m4a
 soundlab enhance *.m4a --target -14             # louder, for social media
 soundlab enhance take.m4a --format wav          # 24-bit WAV master
-soundlab enhance take.m4a --denoiser afftdn     # deepfilter | afftdn | none
+soundlab enhance take.m4a --denoiser afftdn     # deepfilter | resemble | afftdn | none
 soundlab enhance take.m4a --preset voice-b      # alternative DSP chain
 ```
+
+### Resemble Enhance
+
+`--denoiser resemble` uses [Resemble Enhance](https://github.com/resemble-ai/resemble-enhance)
+instead of DeepFilterNet: it removes the noise and then **rebuilds the voice** with a generative
+model. In the first ear test (an 8 s MacBook take) it beat DeepFilterNet: the pauses come out
+~13 dB quieter (−64 vs −51 dB). Because it generates the audio, listen before you use a result.
+It runs on the **CPU** (it crashes on the Mac's GPU) and takes about **3–4× the recording's length**
+(a 34 s take: 2 min). DeepFilterNet stays the default.
+
+```bash
+soundlab enhance take.wav --denoiser resemble                 # ear-tested defaults
+soundlab enhance take.wav --denoiser resemble --tau 0.3 --seed 7
+```
+
+| Setting | GUI | Default | What it does |
+|---|---|---|---|
+| `--tau` | Temperature | 0.5 | 0–1: lower stays closer to the input, higher varies more (0.5 sounded better than 0.2) |
+| `--lambd` | Strength | 1.0 | 0–1: how much it denoises before the rebuild (0.5 vs 1.0 inaudible) |
+| `--nfe` | Steps | 32 | 1–128: fewer = faster (32 vs 64 inaudible, 32 is ~25% faster) |
+| `--solver` | Solver | midpoint | `midpoint` / `rk4` (slower) / `euler` |
+| `--seed` | Variation | 0 | 0–9999: the rebuild starts from random noise, so each number is a slightly different take (±3 dB in the 6–12 kHz band and the pauses); the same settings + number give the same result |
+
+Its *denoise-only* mode isn't offered: on a real take it removed nothing (the output equalled the
+input). Outputs get `_resemble` in their name, and the report lists the settings.
 
 ### Projects
 
@@ -84,6 +115,11 @@ soundlab gui        # opens http://127.0.0.1:8765 in the browser
   20 ms windows under a threshold between the recording's noise floor and speech level; a `_tight`
   file keeps those levels, so tightening it again changes (almost) nothing.
   **✨ Enhance** works the same way: the enhanced version opens in a new track right below.
+  The editor header picks the denoiser for Enhance and Export — **DeepFilterNet** (default) or
+  **Resemble Enhance** — and its **⚙ Settings** (Temperature, Strength, Steps, Solver, Variation, 🎲 for
+  a random one, *Reset to defaults*; a • marks changed settings). The choice and settings are
+  remembered in the browser. While Enhance or Export runs, the button shows the progress; click it
+  again to cancel.
   The **⠿ chip** next to *Add to timeline* drags the selection (trim + speed) to the timeline — or,
   dropped in the editor, makes it a recording of its own: `<name>_part.wav` (lossless, in `inputs/`,
   the source untouched) opens in a new track below the track it lands on, or at the end on empty
@@ -144,9 +180,10 @@ On the first recording macOS asks for mic permission for the terminal app. Witho
 soundlab compare take.m4a
 ```
 
-Processes the same recording stage by stage (unprocessed → light/full DeepFilterNet → EQ) into WAV
-variants all at the same loudness: `<project>/outputs/YYYY-MM-DD/compare_<name>_<time>/`. Use it to
-hear which stage improves or harms the sound.
+Processes the same recording stage by stage (unprocessed → light/full DeepFilterNet → EQ, + Resemble
+Enhance with its defaults if it's installed) into WAV variants all at the same loudness:
+`<project>/outputs/YYYY-MM-DD/compare_<name>_<time>/`. Use it to hear which stage improves or harms
+the sound.
 
 Outputs are saved in the current project as
 `<project>/outputs/YYYY-MM-DD/<name>_<preset>_<HHMMSS>.<ext>`, next to a `.json` report with the
@@ -165,7 +202,8 @@ recording runs on a generated tone (`SOUNDLAB_RECORD_INPUT=tone:330`).
 ## Pipeline
 
 1. 80 Hz high-pass, 48 kHz mono WAV
-2. Denoise: DeepFilterNet3 (`-a 30 --pf`) or `afftdn`
+2. Denoise: DeepFilterNet3 (`-a 30 --pf`), Resemble Enhance (`soundlab/resemble_worker.py`, run with
+   its own venv's Python) or `afftdn`
 3. DSP chain (EQ, de-esser, compressor) — `soundlab/presets.py`
 4. Pre-gain + `alimiter`: keeps peaks under the TP target
 5. 2-pass `loudnorm` (`linear=true`): dynamics stay intact

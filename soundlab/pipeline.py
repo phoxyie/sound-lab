@@ -1,16 +1,19 @@
 """Voice enhancement pipeline.
 
-Flow: 80 Hz HPF + 48 kHz mono WAV → denoise (DeepFilterNet3 / afftdn)
+Flow: 80 Hz HPF + 48 kHz mono WAV → denoise (DeepFilterNet3 / Resemble Enhance / afftdn)
 → DSP chain → 2-pass linear loudnorm → outputs/YYYY-MM-DD/
 """
 
 from __future__ import annotations
 
 import json
+import os
+import queue
 import shutil
 import subprocess
 import tempfile
-from dataclasses import asdict, dataclass
+import threading
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -24,6 +27,7 @@ LIMITER_HEADROOM_DB = 1.0  # limiter ceiling = TP target - this value
 LIMITER_MAX_ITER = 4
 TP_MARGIN_DB = 0.2  # TP margin against measurement differences
 NOISE_FLOOR_MIN_DB = -120.0
+PROGRESS_POLL_SEC = 0.25  # how often a slow external step reports progress (and so notices a cancel)
 
 CODECS = {
     "m4a": ["-c:a", "aac", "-b:a", "192k"],
@@ -31,12 +35,50 @@ CODECS = {
 }
 
 
+DENOISERS = ["auto", "deepfilter", "resemble", "afftdn", "none"]
+RESEMBLE_VENV = PROJECT_ROOT / "tools" / "resemble-venv"
+RESEMBLE_MODEL = PROJECT_ROOT / "tools" / "resemble-model" / "enhancer_stage2"
+RESEMBLE_WORKER = Path(__file__).resolve().parent / "resemble_worker.py"
+RESEMBLE_SOLVERS = ["midpoint", "rk4", "euler"]
+RESEMBLE_NFE_MAX = 128
+RESEMBLE_SEED_MAX = 9999
+
+
+@dataclass
+class ResembleSettings:
+    """Resemble Enhance (full mode: denoise + generative voice rebuild).
+
+    Defaults from an ear test on a real take (2026-10-29): tau 0.5 sounded better than 0.2;
+    nfe 32 vs 64 and lambd 0.5 vs 1.0 were inaudible (nfe 32 is ~25% faster).
+    """
+    tau: float = 0.5  # prior temperature 0–1: lower stays closer to the input, higher varies more
+    nfe: int = 32  # solver function evaluations 1–128: fewer = faster
+    lambd: float = 1.0  # denoise strength 0–1 before the rebuild
+    solver: str = "midpoint"  # midpoint | rk4 | euler
+    # The rebuild starts from random noise; each seed is a slightly different take (as much as ±3 dB
+    # in the 6–12 kHz band and the pauses on the test take). Same settings + seed = same output.
+    seed: int = 0
+
+    def validate(self) -> None:
+        if not 0 <= self.tau <= 1:
+            raise PipelineError("Resemble temperature (tau) must be between 0 and 1")
+        if not 0 <= self.lambd <= 1:
+            raise PipelineError("Resemble strength (lambd) must be between 0 and 1")
+        if not (1 <= self.nfe <= RESEMBLE_NFE_MAX and float(self.nfe).is_integer()):
+            raise PipelineError(f"Resemble steps (nfe) must be a whole number from 1 to {RESEMBLE_NFE_MAX}")
+        if self.solver not in RESEMBLE_SOLVERS:
+            raise PipelineError(f"Unknown Resemble solver: {self.solver} (options: {', '.join(RESEMBLE_SOLVERS)})")
+        if not (0 <= self.seed <= RESEMBLE_SEED_MAX and float(self.seed).is_integer()):
+            raise PipelineError(f"Resemble variation (seed) must be a whole number from 0 to {RESEMBLE_SEED_MAX}")
+
+
 @dataclass
 class EnhanceOptions:
     preset: str = "flat"  # ear test: full DeepFilterNet without EQ sounded best
-    denoiser: str = "auto"  # auto | deepfilter | afftdn | none
+    denoiser: str = "auto"  # auto | deepfilter | resemble | afftdn | none
     atten_lim_db: float = 30.0
     postfilter: bool = True
+    resemble: ResembleSettings = field(default_factory=ResembleSettings)
     target_i: float = -16.0
     target_tp: float = -1.5
     target_lra: float = 11.0
@@ -55,6 +97,14 @@ class PipelineError(RuntimeError):
     pass
 
 
+class Cancelled(PipelineError):
+    """Raised from a progress callback to stop a running enhancement."""
+
+
+# Progress callback: overall fraction 0–1. It may raise Cancelled to stop the job.
+Progress = Callable[[float], None]
+
+
 def resolve_outputs(opts: EnhanceOptions) -> Path:
     return opts.outputs_root or projects.current().outputs
 
@@ -64,6 +114,13 @@ def find_deep_filter() -> str | None:
     if local.is_file():
         return str(local)
     return shutil.which("deep-filter")
+
+
+def find_resemble() -> Path | None:
+    """The Python of Resemble Enhance's own venv, if it and the model are installed."""
+    python = RESEMBLE_VENV / "bin" / "python"
+    weights = RESEMBLE_MODEL / "ds" / "G" / "default" / "mp_rank_00_model_states.pt"
+    return python if python.is_file() and weights.is_file() else None
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -159,7 +216,8 @@ def _output_path(src: Path, opts: EnhanceOptions) -> Path:
     now = datetime.now()
     day_dir = resolve_outputs(opts) / now.strftime("%Y-%m-%d")
     day_dir.mkdir(parents=True, exist_ok=True)
-    base = f"{src.stem}_{opts.preset}_{now.strftime('%H%M%S')}"
+    tag = f"{opts.preset}_resemble" if opts.denoiser == "resemble" else opts.preset
+    base = f"{src.stem}_{tag}_{now.strftime('%H%M%S')}"
     out = day_dir / f"{base}.{opts.fmt}"
     n = 2
     while out.exists():
@@ -168,7 +226,56 @@ def _output_path(src: Path, opts: EnhanceOptions) -> Path:
     return out
 
 
-def _denoise(raw: Path, work: Path, opts: EnhanceOptions, log: Callable[[str], None]) -> tuple[Path, str]:
+def _resemble(raw: Path, work: Path, rs: ResembleSettings, progress: Progress) -> Path:
+    python = find_resemble()
+    if not python:
+        raise PipelineError("Resemble Enhance isn't installed: run ./scripts/install_resemble.sh")
+    out = work / "resemble.wav"
+    err_log = work / "resemble.log"
+    cmd = [str(python), "-I", str(RESEMBLE_WORKER), str(raw), str(out), str(RESEMBLE_MODEL),
+           str(rs.tau), str(int(rs.nfe)), str(rs.lambd), rs.solver, str(int(rs.seed))]
+    env = {**os.environ, "TQDM_DISABLE": "1"}
+    with open(err_log, "w") as err:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True, env=env)
+        # Its first progress line can take ~20 s (model load + the first chunk's denoise pass), so the
+        # lines are read in a thread and progress is reported every PROGRESS_POLL_SEC regardless:
+        # a cancel raised from the callback then stops the worker right away.
+        lines: queue.Queue[str | None] = queue.Queue()
+
+        def read() -> None:
+            for line in proc.stdout:
+                lines.put(line)
+            lines.put(None)
+
+        threading.Thread(target=read, daemon=True).start()
+        last = 0.0
+        try:
+            while True:
+                try:
+                    line = lines.get(timeout=PROGRESS_POLL_SEC)
+                except queue.Empty:
+                    progress(last)
+                    continue
+                if line is None:
+                    break
+                try:
+                    last = float(json.loads(line)["progress"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+                progress(last)
+            proc.wait()
+        finally:
+            if proc.poll() is None:  # cancelled (or failed) mid-run: don't leave it burning the CPU
+                proc.kill()
+                proc.wait()
+    if proc.returncode != 0 or not out.is_file():
+        tail = "\n".join(err_log.read_text(errors="replace").strip().splitlines()[-10:])
+        raise PipelineError(f"Resemble Enhance failed (exit {proc.returncode})\n{tail}")
+    return out
+
+
+def _denoise(raw: Path, work: Path, opts: EnhanceOptions, log: Callable[[str], None],
+             progress: Progress) -> tuple[Path, str]:
     denoiser = opts.denoiser
     deep_filter = find_deep_filter()
     if denoiser == "auto":
@@ -188,6 +295,12 @@ def _denoise(raw: Path, work: Path, opts: EnhanceOptions, log: Callable[[str], N
             raise PipelineError("deep-filter produced no output")
         return wavs[0], f"deepfilternet3 (atten_lim={opts.atten_lim_db}dB{', pf' if opts.postfilter else ''}, -D)"
 
+    if denoiser == "resemble":
+        rs = opts.resemble
+        clean = _resemble(raw, work, rs, progress)
+        return clean, (f"resemble-enhance (tau={rs.tau:g}, nfe={int(rs.nfe)}, lambd={rs.lambd:g}, "
+                       f"solver={rs.solver}, seed={int(rs.seed)}, cpu)")
+
     if denoiser == "afftdn":
         clean = work / "clean.wav"
         _ffmpeg("-i", str(raw), "-af", AFFTDN_FALLBACK, "-c:a", "pcm_f32le", str(clean))
@@ -199,8 +312,12 @@ def _denoise(raw: Path, work: Path, opts: EnhanceOptions, log: Callable[[str], N
     raise PipelineError(f"Unknown denoiser: {opts.denoiser}")
 
 
+# Where each of the 5 stages starts in the overall progress; Resemble's denoise takes nearly all of it
+STAGES = {"resemble": [0.0, 0.02, 0.92, 0.95, 0.98], "other": [0.0, 0.15, 0.45, 0.65, 0.9]}
+
+
 def enhance(src: Path, opts: EnhanceOptions | None = None, log: Callable[[str], None] = print,
-            out: Path | None = None) -> EnhanceResult:
+            out: Path | None = None, progress: Progress | None = None) -> EnhanceResult:
     opts = opts or EnhanceOptions()
     src = Path(src).expanduser().resolve()
     if not src.is_file():
@@ -209,23 +326,36 @@ def enhance(src: Path, opts: EnhanceOptions | None = None, log: Callable[[str], 
         raise PipelineError(f"Unknown preset: {opts.preset} (options: {', '.join(PRESETS)})")
     if opts.fmt not in CODECS:
         raise PipelineError(f"Unknown format: {opts.fmt} (options: {', '.join(CODECS)})")
+    if opts.denoiser not in DENOISERS:
+        raise PipelineError(f"Unknown denoiser: {opts.denoiser} (options: {', '.join(DENOISERS)})")
+    if opts.denoiser == "resemble":
+        opts.resemble.validate()
     dsp = PRESETS[opts.preset]
     started = datetime.now()
+    starts = STAGES["resemble" if opts.denoiser == "resemble" else "other"]
+    report = progress or (lambda _: None)
+
+    def stage(i: int, msg: str) -> None:
+        log(msg)
+        report(starts[i])
+
+    def denoise_progress(f: float) -> None:  # the denoiser's own 0–1, mapped into its stage
+        report(starts[1] + (starts[2] - starts[1]) * f)
 
     with tempfile.TemporaryDirectory(prefix="soundlab-") as tmp:
         work = Path(tmp)
 
-        log("  1/5 Pre-processing (80 Hz HPF, 48 kHz mono)")
+        stage(0, "  1/5 Pre-processing (80 Hz HPF, 48 kHz mono)")
         raw = work / "raw.wav"
         _ffmpeg("-i", str(src), "-af", "highpass=f=80:poles=2",
                 "-ar", str(SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le", str(raw))
         input_loudness = measure_loudness(raw)
         input_noise = measure_noise(raw)
 
-        log("  2/5 Noise reduction")
-        clean, denoise_desc = _denoise(raw, work, opts, log)
+        stage(1, "  2/5 Noise reduction")
+        clean, denoise_desc = _denoise(raw, work, opts, log, denoise_progress)
 
-        log("  3/5 Loudness measurement (pass 1)")
+        stage(2, "  3/5 Loudness measurement (pass 1)")
         m1 = _measure_chain(clean, dsp, opts)
         if float(m1["input_i"]) < -70:
             raise PipelineError("The recording is empty or too quiet (< -70 LUFS)")
@@ -235,7 +365,7 @@ def enhance(src: Path, opts: EnhanceOptions | None = None, log: Callable[[str], 
         # peaks under the TP target with a limiter.
         # The limiter lowers loudness a little; if loudnorm's make-up gain pushes peaks over
         # again, we lower the ceiling by that much and measure again.
-        log("  4/5 Gain + limiter (pass 2)")
+        stage(3, "  4/5 Gain + limiter (pass 2)")
         gain_db = opts.target_i - float(m1["input_i"])
         headroom_db = LIMITER_HEADROOM_DB
         for _ in range(LIMITER_MAX_ITER):
@@ -250,23 +380,27 @@ def enhance(src: Path, opts: EnhanceOptions | None = None, log: Callable[[str], 
             gain_db += linear_gain
             headroom_db += overshoot + 0.2
 
-        log("  5/5 Linear normalization and output")
+        stage(4, "  5/5 Linear normalization and output")
         out = out or _output_path(src, opts)
         proc = _ffmpeg("-i", str(clean), "-af", f"{chain},{_loudnorm_filter(opts, measured)}",
                        "-ar", str(SAMPLE_RATE), *CODECS[opts.fmt], str(out))
         final = _parse_loudnorm_json(proc.stderr)
+    report(1.0)
 
     norm_type = final.get("normalization_type", "unknown")
     if norm_type != "linear":
         log(f"  ! loudnorm fell back to '{norm_type}' mode (target TP/LRA not reachable linearly)")
 
+    options = {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(opts).items()}
+    if opts.denoiser != "resemble":
+        options.pop("resemble")
     data = {
         "source": str(src),
         "output": str(out),
         "created_at": started.isoformat(timespec="seconds"),
         "elapsed_sec": round((datetime.now() - started).total_seconds(), 2),
         "duration_sec": round(probe_duration(out), 2),
-        "options": {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(opts).items()},
+        "options": options,
         "denoiser": denoise_desc,
         "dsp_chain": chain,
         "pre_gain_db": round(gain_db, 2),
