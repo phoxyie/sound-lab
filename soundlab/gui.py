@@ -35,8 +35,10 @@ from .recorder import Recorder, list_audio_devices, pick_device
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 # Overridable via environment so tests don't touch the real Trash or open Finder
-TRASH_DIR = Path(os.environ.get("SOUNDLAB_TRASH", "~/.Trash")).expanduser()
-REVEAL_CMD = os.environ.get("SOUNDLAB_REVEAL_CMD", "open -R").split()
+_default_trash = Path(tempfile.gettempdir()) / "soundlab-trash" if os.name == "nt" else Path("~/.Trash").expanduser()
+TRASH_DIR = Path(os.environ.get("SOUNDLAB_TRASH", _default_trash)).expanduser()
+_default_reveal = ["explorer", "/select,"] if os.name == "nt" else ["open", "-R"]
+REVEAL_CMD = os.environ.get("SOUNDLAB_REVEAL_CMD", "").split() if "SOUNDLAB_REVEAL_CMD" in os.environ else _default_reveal
 # Some browsers won't play the types the system guesses (e.g. audio/mp4a-latm)
 MIME_TYPES = {".wav": "audio/wav", ".m4a": "audio/mp4", ".mp3": "audio/mpeg", ".aiff": "audio/aiff",
               ".aif": "audio/aiff", ".flac": "audio/flac", ".aac": "audio/aac", ".caf": "audio/x-caf",
@@ -319,7 +321,8 @@ def record_cancel():
 @app.get("/api/config")
 def config():
     return jsonify(presets=list(PRESETS), default_preset=EnhanceOptions.preset,
-                   default_target=EnhanceOptions.target_i, formats=list(CODECS),
+                   default_target=EnhanceOptions.target_i, default_tp=EnhanceOptions.target_tp,
+                   default_min_lufs=EnhanceOptions.min_lufs, formats=list(CODECS),
                    resemble={"installed": find_resemble() is not None, "defaults": asdict(ResembleSettings()),
                              "solvers": RESEMBLE_SOLVERS, "nfe_max": RESEMBLE_NFE_MAX, "seed_max": RESEMBLE_SEED_MAX,
                              "rate": [RESEMBLE_RATE_A, RESEMBLE_RATE_B], "confirm_above_sec": RESEMBLE_CONFIRM_SEC},
@@ -349,6 +352,9 @@ def _enhance_options(body: dict) -> EnhanceOptions:
     target = float(body.get("target", EnhanceOptions.target_i))
     if not (TARGET_MIN <= target <= TARGET_MAX):
         raise PipelineError(f"Target loudness must be between {TARGET_MIN} and {TARGET_MAX} LUFS")
+    min_lufs = float(body.get("min_lufs", EnhanceOptions.min_lufs))
+    if not (-100.0 <= min_lufs <= -30.0):
+        raise PipelineError("Minimum loudness threshold must be between -100 and -30 LUFS")
     denoiser = body.get("denoiser", "auto")
     if denoiser not in GUI_DENOISERS:
         raise PipelineError(f"Unknown denoiser: {denoiser}")
@@ -356,7 +362,8 @@ def _enhance_options(body: dict) -> EnhanceOptions:
         raise PipelineError("Resemble Enhance isn't installed: run ./scripts/install_resemble.sh")
     if denoiser == "sidon" and not find_sidon():
         raise PipelineError("Sidon isn't installed: run ./scripts/install_sidon.sh")
-    return EnhanceOptions(preset=preset, target_i=target, fmt=fmt, outputs_root=projects.current().outputs,
+    return EnhanceOptions(preset=preset, target_i=target, min_lufs=min_lufs, fmt=fmt,
+                          outputs_root=projects.current().outputs,
                           denoiser=denoiser, resemble=_resemble_settings(body.get("resemble")))
 
 

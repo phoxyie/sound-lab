@@ -92,6 +92,7 @@ class EnhanceOptions:
     target_i: float = -16.0
     target_tp: float = -1.5
     target_lra: float = 11.0
+    min_lufs: float = -70.0  # reject recordings quieter than this as empty/silent
     fmt: str = "m4a"
     outputs_root: Path | None = None  # None → the current project's outputs/ folder
 
@@ -119,16 +120,25 @@ def resolve_outputs(opts: EnhanceOptions) -> Path:
     return opts.outputs_root or projects.current().outputs
 
 
+def _venv_python(venv: Path) -> Path:
+    win = venv / "Scripts" / "python.exe"
+    return win if os.name == "nt" and win.is_file() else venv / "bin" / "python"
+
+
 def find_deep_filter() -> str | None:
-    local = PROJECT_ROOT / "tools" / "deep-filter"
+    exe = "deep-filter.exe" if os.name == "nt" else "deep-filter"
+    local = PROJECT_ROOT / "tools" / exe
     if local.is_file():
         return str(local)
+    local_nobin = PROJECT_ROOT / "tools" / "deep-filter"
+    if local_nobin.is_file():
+        return str(local_nobin)
     return shutil.which("deep-filter")
 
 
 def find_resemble() -> Path | None:
     """The Python of Resemble Enhance's own venv, if it and the model are installed."""
-    python = RESEMBLE_VENV / "bin" / "python"
+    python = _venv_python(RESEMBLE_VENV)
     weights = RESEMBLE_MODEL / "ds" / "G" / "default" / "mp_rank_00_model_states.pt"
     return python if python.is_file() and weights.is_file() else None
 
@@ -140,7 +150,7 @@ def estimate_resemble_seconds(duration_sec: float, nfe: int) -> float:
 
 def find_sidon() -> Path | None:
     """The Python of Sidon's own venv, if it and the model are installed."""
-    python = SIDON_VENV / "bin" / "python"
+    python = _venv_python(SIDON_VENV)
     return python if python.is_file() and all((SIDON_MODEL / f).is_file() for f in SIDON_FILES) else None
 
 
@@ -399,8 +409,8 @@ def enhance(src: Path, opts: EnhanceOptions | None = None, log: Callable[[str], 
 
         stage(2, "  3/5 Loudness measurement (pass 1)")
         m1 = _measure_chain(clean, dsp, opts)
-        if float(m1["input_i"]) < -70:
-            raise PipelineError("The recording is empty or too quiet (< -70 LUFS)")
+        if float(m1["input_i"]) < opts.min_lufs:
+            raise PipelineError(f"The recording is empty or too quiet (< {opts.min_lufs:.0f} LUFS)")
 
         # On quiet recordings the needed gain pushes peaks above the TP target and loudnorm
         # drops from linear to dynamic mode (pumping). So we apply the gain first and keep

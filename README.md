@@ -3,6 +3,34 @@
 Brings voice recordings made on a MacBook's built-in mic up to social media / podcast standard
 (default **-16 LUFS, -1.5 dBTP**).
 
+## Quick Start: Launch GUI by OS
+
+The web GUI runs at [http://127.0.0.1:8765](http://127.0.0.1:8765) (opens in your default browser automatically).
+
+### Windows
+```powershell
+# PowerShell (direct):
+.\.venv\Scripts\soundlab.exe gui
+
+# Command Prompt (CMD, direct):
+.venv\Scripts\soundlab.exe gui
+
+# Or by activating the virtual environment:
+.\.venv\Scripts\Activate.ps1    # PowerShell
+# or: .venv\Scripts\activate.bat # CMD
+soundlab gui
+```
+
+### macOS / Linux
+```bash
+# Direct:
+.venv/bin/soundlab gui
+
+# Or by activating the virtual environment:
+source .venv/bin/activate
+soundlab gui
+```
+
 ## Setup
 
 ```bash
