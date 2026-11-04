@@ -1,0 +1,33 @@
+# Auto-detect text files and normalize line endings to LF on checkout/commit
+* text=auto eol=lf
+
+# Explicit source code files (always LF)
+*.py text eol=lf
+*.js text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf
+
+# Windows scripts (if added)
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Audio and binary files (never touch line endings)
+*.wav binary
+*.mp3 binary
+*.m4a binary
+*.flac binary
+*.aac binary
+*.ogg binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.zip binary
+*.tar.gz binary
