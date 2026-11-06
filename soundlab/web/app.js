@@ -161,9 +161,10 @@ function toggleGroup(id) {
 }
 
 function itemMeta(f) {
-  if (f.source === "voice-records") return `recording · ${f.folder}`;
-  if (f.source === "inputs") return f.folder ? `imported · ${f.folder}` : "imported";
-  return f.folder;
+  const prefix = f.is_video ? "video · " : "";
+  if (f.source === "voice-records") return `${prefix}recording · ${f.folder}`;
+  if (f.source === "inputs") return f.folder ? `${prefix}imported · ${f.folder}` : `${prefix}imported`;
+  return f.folder ? `${prefix}${f.folder}` : (f.is_video ? "video" : "");
 }
 
 function renderLibrary(flashPath) {

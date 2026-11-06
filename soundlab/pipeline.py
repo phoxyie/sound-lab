@@ -7,6 +7,7 @@ Flow: 80 Hz HPF + 48 kHz mono WAV → denoise (DeepFilterNet3 / Resemble Enhance
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import shutil
@@ -32,6 +33,7 @@ PROGRESS_POLL_SEC = 0.25  # how often a slow external step reports progress (and
 CODECS = {
     "m4a": ["-c:a", "aac", "-b:a", "192k"],
     "wav": ["-c:a", "pcm_s24le"],
+    "mp4": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart"],
 }
 
 
@@ -157,7 +159,7 @@ def find_sidon() -> Path | None:
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        tail = "\n".join(proc.stderr.strip().splitlines()[-15:])
+        tail = "\n".join(proc.stderr.strip().splitlines()[-30:])
         raise PipelineError(f"Command failed: {cmd[0]}\n{tail}")
     return proc
 
@@ -175,12 +177,24 @@ def _parse_loudnorm_json(stderr: str) -> dict:
 
 def _loudnorm_filter(opts: EnhanceOptions, measured: dict | None = None) -> str:
     lra = opts.target_lra
+    valid_measured = False
     if measured:
-        # If the measured LRA exceeds the target, loudnorm gives up linear mode; the compressor
-        # handles dynamics, so we stretch the target to the measured value (capped at 50).
-        lra = min(max(lra, float(measured["input_lra"]) + 0.1), 50.0)
+        try:
+            m_i = float(measured.get("input_i", "nan"))
+            m_tp = float(measured.get("input_tp", "nan"))
+            m_lra = float(measured.get("input_lra", "nan"))
+            m_thresh = float(measured.get("input_thresh", "nan"))
+            m_offset = float(measured.get("target_offset", "nan"))
+            if (not any(math.isinf(x) or math.isnan(x) for x in (m_i, m_tp, m_lra, m_thresh, m_offset))
+                    and -99.0 <= m_i <= 0.0
+                    and -99.0 <= m_offset <= 99.0):
+                valid_measured = True
+                lra = min(max(lra, m_lra + 0.1), 50.0)
+        except (ValueError, TypeError):
+            valid_measured = False
+
     f = f"loudnorm=I={opts.target_i}:TP={opts.target_tp}:LRA={lra:g}:print_format=json"
-    if measured:
+    if valid_measured:
         f += (
             f":measured_I={measured['input_i']}"
             f":measured_TP={measured['input_tp']}"
@@ -195,7 +209,25 @@ def _loudnorm_filter(opts: EnhanceOptions, measured: dict | None = None) -> str:
 def measure_loudness(path: Path) -> dict:
     proc = _ffmpeg("-i", str(path), "-af", "loudnorm=print_format=json", "-f", "null", "-")
     m = _parse_loudnorm_json(proc.stderr)
-    return {"lufs": float(m["input_i"]), "true_peak": float(m["input_tp"]), "lra": float(m["input_lra"])}
+    try:
+        lufs = float(m["input_i"])
+        if math.isinf(lufs) or math.isnan(lufs) or lufs < -90.0:
+            lufs = -99.0
+    except (ValueError, TypeError):
+        lufs = -99.0
+    try:
+        tp = float(m["input_tp"])
+        if math.isinf(tp) or math.isnan(tp):
+            tp = -99.0
+    except (ValueError, TypeError):
+        tp = -99.0
+    try:
+        lra = float(m["input_lra"])
+        if math.isinf(lra) or math.isnan(lra):
+            lra = 0.0
+    except (ValueError, TypeError):
+        lra = 0.0
+    return {"lufs": lufs, "true_peak": tp, "lra": lra}
 
 
 RMS_WINDOW = 0.02  # seconds
@@ -409,7 +441,8 @@ def enhance(src: Path, opts: EnhanceOptions | None = None, log: Callable[[str], 
 
         stage(2, "  3/5 Loudness measurement (pass 1)")
         m1 = _measure_chain(clean, dsp, opts)
-        if float(m1["input_i"]) < opts.min_lufs:
+        lufs_val = float(m1.get("input_i", "-inf"))
+        if math.isinf(lufs_val) or math.isnan(lufs_val) or lufs_val < opts.min_lufs:
             raise PipelineError(f"The recording is empty or too quiet (< {opts.min_lufs:.0f} LUFS)")
 
         # On quiet recordings the needed gain pushes peaks above the TP target and loudnorm
@@ -418,15 +451,21 @@ def enhance(src: Path, opts: EnhanceOptions | None = None, log: Callable[[str], 
         # The limiter lowers loudness a little; if loudnorm's make-up gain pushes peaks over
         # again, we lower the ceiling by that much and measure again.
         stage(3, "  4/5 Gain + limiter (pass 2)")
-        gain_db = opts.target_i - float(m1["input_i"])
+        gain_db = max(-30.0, min(50.0, opts.target_i - lufs_val))
         headroom_db = LIMITER_HEADROOM_DB
+        measured = None
         for _ in range(LIMITER_MAX_ITER):
             ceiling = 10 ** ((opts.target_tp - headroom_db) / 20)
+            ceiling = max(0.0001, min(1.0, ceiling))
             chain = f"{dsp},volume={gain_db:.2f}dB,alimiter=limit={ceiling:.4f}:attack=5:release=50:level=false"
             measured = _measure_chain(clean, chain, opts)
+            m_i = float(measured.get("input_i", "-inf"))
+            m_tp = float(measured.get("input_tp", "-inf"))
+            if math.isinf(m_i) or math.isnan(m_i) or math.isinf(m_tp) or math.isnan(m_tp):
+                break
             # in linear mode loudnorm applies (target_i - measured_i) of gain
-            linear_gain = opts.target_i - float(measured["input_i"])
-            overshoot = float(measured["input_tp"]) + linear_gain - (opts.target_tp - TP_MARGIN_DB)
+            linear_gain = opts.target_i - m_i
+            overshoot = m_tp + linear_gain - (opts.target_tp - TP_MARGIN_DB)
             if overshoot <= 0:
                 break
             gain_db += linear_gain
@@ -434,8 +473,10 @@ def enhance(src: Path, opts: EnhanceOptions | None = None, log: Callable[[str], 
 
         stage(4, "  5/5 Linear normalization and output")
         out = out or _output_path(src, opts)
+        out_fmt = out.suffix.lstrip(".").lower()
+        codec_args = CODECS.get(out_fmt, CODECS[opts.fmt])
         proc = _ffmpeg("-i", str(clean), "-af", f"{chain},{_loudnorm_filter(opts, measured)}",
-                       "-ar", str(SAMPLE_RATE), *CODECS[opts.fmt], str(out))
+                       "-ar", str(SAMPLE_RATE), *codec_args, str(out))
         final = _parse_loudnorm_json(proc.stderr)
     report(1.0)
 

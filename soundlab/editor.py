@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import tempfile
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
@@ -177,6 +178,60 @@ def pause_cuts(path: Path, max_pause: float = PAUSE_MAX, threshold: float | None
     return keep, shortened
 
 
+def has_video_stream(path: Path) -> bool:
+    """Checks whether the file has a video stream that is not an attached album art image."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_type:disposition=attached_pic",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, check=True
+        )
+        streams = json.loads(proc.stdout).get("streams", [])
+        return any(s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic") for s in streams)
+    except Exception:
+        return False
+
+
+def has_audio_stream(path: Path) -> bool:
+    """Checks whether the file has at least one audio stream."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, check=True
+        )
+        return bool(json.loads(proc.stdout).get("streams"))
+    except Exception:
+        return False
+
+
+def probe_video_info(path: Path) -> dict:
+    """Returns video width, height, and frame rate for rendering / scale normalization."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, check=True
+        )
+        streams = json.loads(proc.stdout).get("streams", [])
+        if streams:
+            s = streams[0]
+            fps = s.get("r_frame_rate") or "30/1"
+            if fps == "0/0":
+                fps = "30/1"
+            return {
+                "width": int(s.get("width") or 1920),
+                "height": int(s.get("height") or 1080),
+                "fps": fps,
+            }
+    except Exception:
+        pass
+    return {"width": 1920, "height": 1080, "fps": "30/1"}
+
+
 def keep_segments(src: Path, keep: list[list[float]], out: Path, codec_args: list[str]) -> None:
     """Writes only the given [start, end] segments of src, back to back, with a short fade on each
     side of every cut so none of them clicks (src is a WAV: -ss seeks are sample-accurate)."""
@@ -189,6 +244,35 @@ def keep_segments(src: Path, keep: list[list[float]], out: Path, codec_args: lis
     _ffmpeg(*inputs, "-filter_complex", ";".join(parts), "-map", "[out]", *codec_args, str(out))
 
 
+def _balance_expr(items: list[str]) -> str:
+    """Combines a list of boolean expressions into a balanced binary tree to avoid FFmpeg recursion limits."""
+    if not items:
+        return "0"
+    if len(items) == 1:
+        return items[0]
+    mid = len(items) // 2
+    return f"({_balance_expr(items[:mid])}+{_balance_expr(items[mid:])})"
+
+
+def keep_video_segments(src: Path, keep: list[list[float]], tight_audio: Path, out: Path) -> None:
+    """Writes only the given [start, end] segments of a video src in a single fast linear pass,
+    muxing the pre-faded tight audio."""
+    if not keep:
+        return
+    with tempfile.TemporaryDirectory(prefix="soundlab-vidcut-") as tmp:
+        conds = [f"between(t,{a:.3f},{b:.3f})" for a, b in keep]
+        expr = _balance_expr(conds)
+        filter_str = f"[0:v]select='{expr}',setpts=N/FRAME_RATE/TB[outv]"
+        script_file = Path(tmp) / "video_filter.txt"
+        script_file.write_text(filter_str, encoding="utf-8")
+        _ffmpeg("-i", str(src), "-i", str(tight_audio),
+                "-/filter_complex", str(script_file),
+                "-map", "[outv]", "-map", "1:a",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart",
+                str(out))
+
+
 def pause_threshold(threshold: float, speech_db: float, max_pause: float) -> float:
     """Slider position → silence threshold. Full left (Skip silence) treats everything SKIP_DROP dB
     under the voice as silence — room tone, breaths, word tails — like Voice Memos; towards the right
@@ -198,7 +282,7 @@ def pause_threshold(threshold: float, speech_db: float, max_pause: float) -> flo
 
 
 def tighten(src: Path, start: float, end: float, out_dir: Path, max_pause: float = PAUSE_MAX) -> dict | None:
-    """A tightened copy of src[start:end] → <name>_tight.wav (+ .json report) in out_dir.
+    """A tightened copy of src[start:end] → <name>_tight.wav (or .mp4) (+ .json report) in out_dir.
 
     Silence at both ends is trimmed to a short lead-in / decay (speech_bounds) and inner pauses longer
     than max_pause are cut down to it (pause_cuts). The source is left untouched; None if there is
@@ -228,26 +312,34 @@ def tighten(src: Path, start: float, end: float, out_dir: Path, max_pause: float
         removed = total - sum(b - a for a, b in keep)
         if removed < 0.05:
             return None
+        is_video = has_video_stream(src)
+        ext = ".mp4" if is_video else ".wav"
         base = src.stem.removesuffix("_tight")
         out_dir.mkdir(parents=True, exist_ok=True)
-        out, n = out_dir / f"{base}_tight.wav", 2
+        out, n = out_dir / f"{base}_tight{ext}", 2
         while out.exists():
-            out, n = out_dir / f"{base}_tight-{n}.wav", n + 1
-        keep_segments(part, keep, out, ["-c:a", "pcm_s24le"])
+            out, n = out_dir / f"{base}_tight-{n}{ext}", n + 1
+        if is_video:
+            tight_audio = Path(tmp) / "tight_audio.wav"
+            keep_segments(part, keep, tight_audio, ["-c:a", "pcm_s16le"])
+            abs_keep = [[round(start + a, 3), round(start + b, 3)] for a, b in keep]
+            keep_video_segments(src, abs_keep, tight_audio, out)
+        else:
+            keep_segments(part, keep, out, ["-c:a", "pcm_s24le"])
     data = {
         "source": str(src), "output": str(out), "created_at": datetime.now().isoformat(timespec="seconds"),
         "tightened": True, "range": [round(start, 3), round(end, 3)], "max_pause_sec": max_pause,
         "threshold_db": round(threshold, 2), "speech_db": speech_db, "cut_below_db": round(cut_at, 2),
         "trimmed_sec": [round(max(0.0, keep[0][0]), 2), round(max(0.0, total - keep[-1][1]), 2)],
         "pauses_shortened": len(keep) - 1, "removed_sec": round(removed, 2),
-        "duration_sec": round(probe_duration(out), 2), "keep": keep,
+        "duration_sec": round(probe_duration(out), 2), "keep": keep, "is_video": is_video,
     }
     out.with_suffix(".json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
     return data
 
 
 def extract(src: Path, start: float, end: float, out_dir: Path) -> dict:
-    """src[start:end] as a file of its own → <name>_part.wav (+ .json report) in out_dir.
+    """src[start:end] as a file of its own → <name>_part.wav (or .mp4) (+ .json report) in out_dir.
 
     The editor's "copy the selection to a new track": the new track is a recording of its own, not
     a view into the source. The source is left untouched. Levels measured for Tighten carry over, so
@@ -255,12 +347,28 @@ def extract(src: Path, start: float, end: float, out_dir: Path) -> dict:
     """
     if end - start < 0.05:
         raise PipelineError("The selection is too short")
+    is_video = has_video_stream(src)
+    ext = ".mp4" if is_video else ".wav"
     base = re.sub(r"_part(-\d+)?$", "", src.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out, n = out_dir / f"{base}_part.wav", 2
+    out, n = out_dir / f"{base}_part{ext}", 2
     while out.exists():
-        out, n = out_dir / f"{base}_part-{n}.wav", n + 1
-    render([Clip(src, start, end, 1.0)], out, ["-c:a", "pcm_s24le"])
+        out, n = out_dir / f"{base}_part-{n}{ext}", n + 1
+    if is_video:
+        dur = end - start
+        fade = min(EDGE_FADE, dur / 2)
+        filter_str = (
+            f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS[outv];"
+            f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:d={fade:.4f},areverse,afade=t=in:d={fade:.4f},areverse[outa]"
+        )
+        _ffmpeg("-i", str(src), "-filter_complex", filter_str,
+                "-map", "[outv]", "-map", "[outa]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart",
+                str(out))
+    else:
+        render([Clip(src, start, end, 1.0)], out, ["-c:a", "pcm_s24le"])
     try:
         prev = json.loads(src.with_suffix(".json").read_text())
     except (OSError, ValueError):
@@ -268,6 +376,7 @@ def extract(src: Path, start: float, end: float, out_dir: Path) -> dict:
     data = {
         "source": str(src), "output": str(out), "created_at": datetime.now().isoformat(timespec="seconds"),
         "part": True, "range": [round(start, 3), round(end, 3)], "duration_sec": round(probe_duration(out), 2),
+        "is_video": is_video,
         **{k: prev[k] for k in ("threshold_db", "speech_db") if k in prev},
     }
     out.with_suffix(".json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
@@ -291,19 +400,63 @@ def export_timeline(clips: list[Clip], enhance_it: bool = True, opts: EnhanceOpt
                     log: Callable[[str], None] = print, progress: Progress | None = None) -> dict:
     """Renders the timeline, enhancing it if asked; output + JSON report go to outputs/YYYY-MM-DD/."""
     opts = opts or EnhanceOptions()
-    if opts.fmt not in CODECS:
-        raise PipelineError(f"Unknown format: {opts.fmt}")
-    out = _export_path(resolve_outputs(opts), opts.fmt, f"{opts.denoiser}_" if enhance_it and opts.denoiser in GENERATIVE else "")
+    has_video = any(has_video_stream(c.path) for c in clips)
+    fmt = "mp4" if has_video else opts.fmt
+    if fmt not in CODECS:
+        raise PipelineError(f"Unknown format: {fmt}")
+    out = _export_path(resolve_outputs(opts), fmt, f"{opts.denoiser}_" if enhance_it and opts.denoiser in GENERATIVE else "")
 
     with tempfile.TemporaryDirectory(prefix="soundlab-edit-") as tmp:
         joined = Path(tmp) / "joined.wav"
         render(clips, joined, ["-c:a", "pcm_f32le"])
-        if enhance_it:
-            data = enhance(joined, opts, log=log, out=out, progress=progress).data
-            data["source"] = "timeline"
+        if has_video:
+            if enhance_it:
+                enhanced_audio = Path(tmp) / "enhanced.wav"
+                data = enhance(joined, opts, log=log, out=enhanced_audio, progress=progress).data
+                data["source"] = "timeline"
+            else:
+                enhanced_audio = joined
+                data = {"source": "timeline", "duration_sec": round(probe_duration(joined), 2)}
+
+            ref_clip = next(c for c in clips if has_video_stream(c.path))
+            v_info = probe_video_info(ref_clip.path)
+            w, h, fps = v_info["width"], v_info["height"], v_info["fps"]
+
+            inputs, parts = [], []
+            for i, c in enumerate(clips):
+                inputs += ["-i", str(c.path)]
+                if has_video_stream(c.path):
+                    v_filter = f"[{i}:v]trim=start={c.start:.3f}:end={c.end:.3f},setpts=PTS-STARTPTS"
+                    if abs(c.speed - 1.0) > 1e-3:
+                        v_filter += f",setpts=(1/{c.speed:.4f})*PTS"
+                    v_filter += f",scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}[v{i}]"
+                else:
+                    dur = (c.end - c.start) / c.speed
+                    v_filter = f"color=c=black:s={w}x{h}:r={fps}:d={dur:.3f}[v{i}]"
+                parts.append(v_filter)
+            joined_v = "".join(f"[v{i}]" for i in range(len(clips)))
+            parts.append(f"{joined_v}concat=n={len(clips)}:v=1:a=0[outv]")
+
+            audio_idx = len(clips)
+            inputs += ["-i", str(enhanced_audio)]
+
+            script_file = Path(tmp) / "timeline_video_filter.txt"
+            script_file.write_text(";".join(parts), encoding="utf-8")
+            _ffmpeg(*inputs, "-/filter_complex", str(script_file),
+                    "-map", "[outv]", "-map", f"{audio_idx}:a",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart",
+                    str(out))
+            data["output"] = str(out)
+            data["duration_sec"] = round(probe_duration(out), 2)
+            data["is_video"] = True
         else:
-            _ffmpeg("-i", str(joined), *CODECS[opts.fmt], str(out))
-            data = {"source": "timeline", "output": str(out), "duration_sec": round(probe_duration(out), 2)}
+            if enhance_it:
+                data = enhance(joined, opts, log=log, out=out, progress=progress).data
+                data["source"] = "timeline"
+            else:
+                _ffmpeg("-i", str(joined), *CODECS[opts.fmt], str(out))
+                data = {"source": "timeline", "output": str(out), "duration_sec": round(probe_duration(out), 2)}
 
     data["clips"] = [{**asdict(c), "path": str(c.path)} for c in clips]
     data["enhanced"] = enhance_it
