@@ -29,3 +29,6 @@ HANDOFF.md
 .vscode/
 .idea/
 .DS_Store
+.oxob/
+**/__pycache__/
+*.pyc
