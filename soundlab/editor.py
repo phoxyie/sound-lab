@@ -234,14 +234,42 @@ def probe_video_info(path: Path) -> dict:
 
 def keep_segments(src: Path, keep: list[list[float]], out: Path, codec_args: list[str]) -> None:
     """Writes only the given [start, end] segments of src, back to back, with a short fade on each
-    side of every cut so none of them clicks (src is a WAV: -ss seeks are sample-accurate)."""
-    inputs, parts = [], []
-    for i, (a, b) in enumerate(keep):
-        inputs += ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", str(src)]
-        fade = min(CUT_FADE, (b - a) / 2)
-        parts.append(f"[{i}:a]afade=t=in:d={fade:.4f},areverse,afade=t=in:d={fade:.4f},areverse[s{i}]")
-    parts.append("".join(f"[s{i}]" for i in range(len(keep))) + f"concat=n={len(keep)}:v=0:a=1[out]")
-    _ffmpeg(*inputs, "-filter_complex", ";".join(parts), "-map", "[out]", *codec_args, str(out))
+    side of every cut so none of them clicks (src is a WAV: -ss seeks are sample-accurate).
+    
+    Batches segments into chunks to stay well within OS command-line length limits (e.g. Windows
+    32k character limit) and process descriptor limits on long recordings.
+    """
+    if not keep:
+        return
+    chunk_size = 40
+    with tempfile.TemporaryDirectory(prefix="soundlab-keep-") as tmp:
+        tmp_dir = Path(tmp)
+
+        def _render_batch(segments: list[list[float]], dest: Path) -> None:
+            inputs, parts = [], []
+            for i, (a, b) in enumerate(segments):
+                inputs += ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", str(src)]
+                fade = min(CUT_FADE, (b - a) / 2)
+                parts.append(f"[{i}:a]afade=t=in:d={fade:.4f},areverse,afade=t=in:d={fade:.4f},areverse[s{i}]")
+            parts.append("".join(f"[s{i}]" for i in range(len(segments))) + f"concat=n={len(segments)}:v=0:a=1[out]")
+            script = tmp_dir / f"filter_{dest.stem}.txt"
+            script.write_text(";".join(parts), encoding="utf-8")
+            _ffmpeg(*inputs, "-/filter_complex", str(script), "-map", "[out]", *codec_args, str(dest))
+
+        if len(keep) <= chunk_size:
+            _render_batch(keep, out)
+            return
+
+        chunk_files = []
+        for idx, i in enumerate(range(0, len(keep), chunk_size)):
+            batch = keep[i : i + chunk_size]
+            c_file = tmp_dir / f"chunk_{idx}.wav"
+            _render_batch(batch, c_file)
+            chunk_files.append(c_file)
+
+        list_file = tmp_dir / "concat_list.txt"
+        list_file.write_text("\n".join(f"file '{c.resolve().as_posix()}'" for c in chunk_files), encoding="utf-8")
+        _ffmpeg("-f", "concat", "-safe", "0", "-i", str(list_file), *codec_args, str(out))
 
 
 def _balance_expr(items: list[str]) -> str:

@@ -174,6 +174,15 @@ class TestVideoProcessing(unittest.TestCase):
             enhance(silent_wav, EnhanceOptions())
         self.assertIn("empty or too quiet", str(ctx.exception))
 
+    def test_07_keep_segments_chunking(self):
+        from soundlab.editor import keep_segments
+        # Generate 100 small segments (more than chunk_size=40)
+        keep = [[round(i * 0.02, 3), round(i * 0.02 + 0.015, 3)] for i in range(100)]
+        out_wav = self.tmp_dir / "test_chunked.wav"
+        keep_segments(self.src_audio, keep, out_wav, ["-c:a", "pcm_s16le"])
+        self.assertTrue(out_wav.is_file())
+        self.assertGreater(probe_duration(out_wav), 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()
