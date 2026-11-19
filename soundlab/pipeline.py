@@ -7,6 +7,7 @@ Flow: 80 Hz HPF + 48 kHz mono WAV → denoise (DeepFilterNet3 / Resemble Enhance
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import shutil
@@ -33,6 +34,9 @@ CODECS = {
     "m4a": ["-c:a", "aac", "-b:a", "192k"],
     "wav": ["-c:a", "pcm_s24le"],
 }
+# Video outputs (timeline export / Tighten / extract of a video): always MP4, not a user-selectable format
+VIDEO_CODEC = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+               "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart"]
 
 
 DENOISERS = ["auto", "deepfilter", "resemble", "sidon", "afftdn", "none"]
@@ -92,6 +96,7 @@ class EnhanceOptions:
     target_i: float = -16.0
     target_tp: float = -1.5
     target_lra: float = 11.0
+    min_lufs: float = -70.0  # reject recordings quieter than this as empty/silent
     fmt: str = "m4a"
     outputs_root: Path | None = None  # None → the current project's outputs/ folder
 
@@ -119,16 +124,25 @@ def resolve_outputs(opts: EnhanceOptions) -> Path:
     return opts.outputs_root or projects.current().outputs
 
 
+def _venv_python(venv: Path) -> Path:
+    win = venv / "Scripts" / "python.exe"
+    return win if os.name == "nt" and win.is_file() else venv / "bin" / "python"
+
+
 def find_deep_filter() -> str | None:
-    local = PROJECT_ROOT / "tools" / "deep-filter"
+    exe = "deep-filter.exe" if os.name == "nt" else "deep-filter"
+    local = PROJECT_ROOT / "tools" / exe
     if local.is_file():
         return str(local)
+    local_nobin = PROJECT_ROOT / "tools" / "deep-filter"
+    if local_nobin.is_file():
+        return str(local_nobin)
     return shutil.which("deep-filter")
 
 
 def find_resemble() -> Path | None:
     """The Python of Resemble Enhance's own venv, if it and the model are installed."""
-    python = RESEMBLE_VENV / "bin" / "python"
+    python = _venv_python(RESEMBLE_VENV)
     weights = RESEMBLE_MODEL / "ds" / "G" / "default" / "mp_rank_00_model_states.pt"
     return python if python.is_file() and weights.is_file() else None
 
@@ -140,14 +154,14 @@ def estimate_resemble_seconds(duration_sec: float, nfe: int) -> float:
 
 def find_sidon() -> Path | None:
     """The Python of Sidon's own venv, if it and the model are installed."""
-    python = SIDON_VENV / "bin" / "python"
+    python = _venv_python(SIDON_VENV)
     return python if python.is_file() and all((SIDON_MODEL / f).is_file() for f in SIDON_FILES) else None
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        tail = "\n".join(proc.stderr.strip().splitlines()[-15:])
+        tail = "\n".join(proc.stderr.strip().splitlines()[-30:])
         raise PipelineError(f"Command failed: {cmd[0]}\n{tail}")
     return proc
 
@@ -165,12 +179,24 @@ def _parse_loudnorm_json(stderr: str) -> dict:
 
 def _loudnorm_filter(opts: EnhanceOptions, measured: dict | None = None) -> str:
     lra = opts.target_lra
+    valid_measured = False
     if measured:
-        # If the measured LRA exceeds the target, loudnorm gives up linear mode; the compressor
-        # handles dynamics, so we stretch the target to the measured value (capped at 50).
-        lra = min(max(lra, float(measured["input_lra"]) + 0.1), 50.0)
+        try:
+            m_i = float(measured.get("input_i", "nan"))
+            m_tp = float(measured.get("input_tp", "nan"))
+            m_lra = float(measured.get("input_lra", "nan"))
+            m_thresh = float(measured.get("input_thresh", "nan"))
+            m_offset = float(measured.get("target_offset", "nan"))
+            if (not any(math.isinf(x) or math.isnan(x) for x in (m_i, m_tp, m_lra, m_thresh, m_offset))
+                    and -99.0 <= m_i <= 0.0
+                    and -99.0 <= m_offset <= 99.0):
+                valid_measured = True
+                lra = min(max(lra, m_lra + 0.1), 50.0)
+        except (ValueError, TypeError):
+            valid_measured = False
+
     f = f"loudnorm=I={opts.target_i}:TP={opts.target_tp}:LRA={lra:g}:print_format=json"
-    if measured:
+    if valid_measured:
         f += (
             f":measured_I={measured['input_i']}"
             f":measured_TP={measured['input_tp']}"
@@ -185,7 +211,25 @@ def _loudnorm_filter(opts: EnhanceOptions, measured: dict | None = None) -> str:
 def measure_loudness(path: Path) -> dict:
     proc = _ffmpeg("-i", str(path), "-af", "loudnorm=print_format=json", "-f", "null", "-")
     m = _parse_loudnorm_json(proc.stderr)
-    return {"lufs": float(m["input_i"]), "true_peak": float(m["input_tp"]), "lra": float(m["input_lra"])}
+    try:
+        lufs = float(m["input_i"])
+        if math.isinf(lufs) or math.isnan(lufs) or lufs < -90.0:
+            lufs = -99.0
+    except (ValueError, TypeError):
+        lufs = -99.0
+    try:
+        tp = float(m["input_tp"])
+        if math.isinf(tp) or math.isnan(tp):
+            tp = -99.0
+    except (ValueError, TypeError):
+        tp = -99.0
+    try:
+        lra = float(m["input_lra"])
+        if math.isinf(lra) or math.isnan(lra):
+            lra = 0.0
+    except (ValueError, TypeError):
+        lra = 0.0
+    return {"lufs": lufs, "true_peak": tp, "lra": lra}
 
 
 RMS_WINDOW = 0.02  # seconds
@@ -290,6 +334,52 @@ def _run_worker(name: str, cmd: list[str], out: Path, log_file: Path, progress: 
         tail = "\n".join(log_file.read_text(errors="replace").strip().splitlines()[-10:])
         raise PipelineError(f"{name} failed (exit {proc.returncode})\n{tail}")
     return out
+
+
+def ffmpeg_progress(args: list[str], duration: float, progress: Progress | None) -> None:
+    """Runs ffmpeg with progress reports (fraction of `duration` written) so a long render (a video
+    encode) can show progress and be cancelled: a Cancelled raised by the callback kills ffmpeg."""
+    if progress is None:
+        _ffmpeg(*args)
+        return
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats", *args]
+    with tempfile.TemporaryFile(mode="w+") as err:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True)
+        lines: queue.Queue[str | None] = queue.Queue()
+
+        def read() -> None:
+            for line in proc.stdout:
+                lines.put(line)
+            lines.put(None)
+
+        threading.Thread(target=read, daemon=True).start()
+        last = 0.0
+        try:
+            while True:
+                try:
+                    line = lines.get(timeout=PROGRESS_POLL_SEC)
+                except queue.Empty:
+                    progress(last)
+                    continue
+                if line is None:
+                    break
+                key, _, value = line.strip().partition("=")
+                if key == "out_time_us" and duration > 0:
+                    try:
+                        last = min(1.0, max(0.0, int(value) / 1e6 / duration))
+                    except ValueError:
+                        continue
+                    progress(last)
+            proc.wait()
+        finally:
+            if proc.poll() is None:  # cancelled mid-run: don't leave it burning the CPU
+                proc.kill()
+                proc.wait()
+            proc.stdout.close()
+        if proc.returncode != 0:
+            err.seek(0)
+            tail = "\n".join(err.read().strip().splitlines()[-30:])
+            raise PipelineError(f"Command failed: ffmpeg\n{tail}")
 
 
 def _resemble(raw: Path, work: Path, rs: ResembleSettings, progress: Progress) -> Path:
@@ -399,8 +489,9 @@ def enhance(src: Path, opts: EnhanceOptions | None = None, log: Callable[[str], 
 
         stage(2, "  3/5 Loudness measurement (pass 1)")
         m1 = _measure_chain(clean, dsp, opts)
-        if float(m1["input_i"]) < -70:
-            raise PipelineError("The recording is empty or too quiet (< -70 LUFS)")
+        lufs_val = float(m1.get("input_i", "-inf"))
+        if math.isinf(lufs_val) or math.isnan(lufs_val) or lufs_val < opts.min_lufs:
+            raise PipelineError(f"The recording is empty or too quiet (< {opts.min_lufs:.0f} LUFS)")
 
         # On quiet recordings the needed gain pushes peaks above the TP target and loudnorm
         # drops from linear to dynamic mode (pumping). So we apply the gain first and keep
@@ -408,15 +499,20 @@ def enhance(src: Path, opts: EnhanceOptions | None = None, log: Callable[[str], 
         # The limiter lowers loudness a little; if loudnorm's make-up gain pushes peaks over
         # again, we lower the ceiling by that much and measure again.
         stage(3, "  4/5 Gain + limiter (pass 2)")
-        gain_db = opts.target_i - float(m1["input_i"])
+        gain_db = opts.target_i - lufs_val
         headroom_db = LIMITER_HEADROOM_DB
+        measured = None
         for _ in range(LIMITER_MAX_ITER):
             ceiling = 10 ** ((opts.target_tp - headroom_db) / 20)
             chain = f"{dsp},volume={gain_db:.2f}dB,alimiter=limit={ceiling:.4f}:attack=5:release=50:level=false"
             measured = _measure_chain(clean, chain, opts)
+            m_i = float(measured.get("input_i", "-inf"))
+            m_tp = float(measured.get("input_tp", "-inf"))
+            if math.isinf(m_i) or math.isnan(m_i) or math.isinf(m_tp) or math.isnan(m_tp):
+                break
             # in linear mode loudnorm applies (target_i - measured_i) of gain
-            linear_gain = opts.target_i - float(measured["input_i"])
-            overshoot = float(measured["input_tp"]) + linear_gain - (opts.target_tp - TP_MARGIN_DB)
+            linear_gain = opts.target_i - m_i
+            overshoot = m_tp + linear_gain - (opts.target_tp - TP_MARGIN_DB)
             if overshoot <= 0:
                 break
             gain_db += linear_gain
@@ -424,8 +520,10 @@ def enhance(src: Path, opts: EnhanceOptions | None = None, log: Callable[[str], 
 
         stage(4, "  5/5 Linear normalization and output")
         out = out or _output_path(src, opts)
+        out_fmt = out.suffix.lstrip(".").lower()
+        codec_args = CODECS.get(out_fmt, CODECS[opts.fmt])
         proc = _ffmpeg("-i", str(clean), "-af", f"{chain},{_loudnorm_filter(opts, measured)}",
-                       "-ar", str(SAMPLE_RATE), *CODECS[opts.fmt], str(out))
+                       "-ar", str(SAMPLE_RATE), *codec_args, str(out))
         final = _parse_loudnorm_json(proc.stderr)
     report(1.0)
 

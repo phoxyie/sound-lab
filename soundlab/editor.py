@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 import tempfile
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
-from .pipeline import (CODECS, GENERATIVE, RMS_WINDOW, SAMPLE_RATE, EnhanceOptions, PipelineError, Progress, _ffmpeg, enhance,
-                       noise_levels, probe_duration, resolve_outputs, rms_windows)
+from .pipeline import (CODECS, GENERATIVE, RMS_WINDOW, SAMPLE_RATE, VIDEO_CODEC, EnhanceOptions, PipelineError, Progress,
+                       _ffmpeg, enhance, ffmpeg_progress, noise_levels, probe_duration, resolve_outputs, rms_windows)
 
 SPEED_MIN, SPEED_MAX = 0.5, 2.0
 # Micro-fade at every clip edge: a cut mid-waveform jumps to/from a non-zero sample and clicks
@@ -177,16 +180,160 @@ def pause_cuts(path: Path, max_pause: float = PAUSE_MAX, threshold: float | None
     return keep, shortened
 
 
+def has_video_stream(path: Path) -> bool:
+    """Checks whether the file has a video stream that is not an attached album art image."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_type:disposition=attached_pic",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, check=True
+        )
+        streams = json.loads(proc.stdout).get("streams", [])
+        return any(s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic") for s in streams)
+    except Exception:
+        return False
+
+
+def has_audio_stream(path: Path) -> bool:
+    """Checks whether the file has at least one audio stream."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, check=True
+        )
+        return bool(json.loads(proc.stdout).get("streams"))
+    except Exception:
+        return False
+
+
+def probe_video_info(path: Path) -> dict:
+    """Video width, height (as displayed: a phone's rotation applied, rounded down to even numbers for
+    H.264) and frame rate (a fraction string such as "30000/1001")."""
+    info = {"width": 1920, "height": 1080, "fps": "30/1"}
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate:stream_side_data=rotation"
+             ":stream_tags=rotate", "-of", "json", str(path)],
+            capture_output=True, text=True, check=True
+        )
+        streams = json.loads(proc.stdout).get("streams", [])
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return info
+    if not streams:
+        return info
+    s = streams[0]
+    w, h = int(s.get("width") or 1920), int(s.get("height") or 1080)
+    rotation = s.get("tags", {}).get("rotate") or next(
+        (d["rotation"] for d in s.get("side_data_list", []) if "rotation" in d), 0)
+    try:
+        if int(float(rotation)) % 180 == 90 or int(float(rotation)) % 180 == -90:
+            w, h = h, w
+    except ValueError:
+        pass
+    fps = "30/1"
+    for key in ("avg_frame_rate", "r_frame_rate"):  # avg: phones record variable frame rate
+        try:
+            f = Fraction(s.get(key) or "0/1")
+        except (ValueError, ZeroDivisionError):
+            continue
+        if 1 <= f <= 240:
+            fps = f"{f.numerator}/{f.denominator}"
+            break
+    return {"width": max(2, w - w % 2), "height": max(2, h - h % 2), "fps": fps}
+
+
+KEEP_CHUNK = 40  # Tighten: segments per ffmpeg run (Windows' 32k-character command line, open inputs)
+
+
 def keep_segments(src: Path, keep: list[list[float]], out: Path, codec_args: list[str]) -> None:
     """Writes only the given [start, end] segments of src, back to back, with a short fade on each
-    side of every cut so none of them clicks (src is a WAV: -ss seeks are sample-accurate)."""
-    inputs, parts = [], []
-    for i, (a, b) in enumerate(keep):
-        inputs += ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", str(src)]
-        fade = min(CUT_FADE, (b - a) / 2)
-        parts.append(f"[{i}:a]afade=t=in:d={fade:.4f},areverse,afade=t=in:d={fade:.4f},areverse[s{i}]")
-    parts.append("".join(f"[s{i}]" for i in range(len(keep))) + f"concat=n={len(keep)}:v=0:a=1[out]")
-    _ffmpeg(*inputs, "-filter_complex", ";".join(parts), "-map", "[out]", *codec_args, str(out))
+    side of every cut so none of them clicks (src is a WAV: -ss seeks are sample-accurate).
+
+    Batches segments into chunks to stay well within OS command-line length limits (e.g. Windows
+    32k character limit) and process descriptor limits on long recordings.
+    """
+    if not keep:
+        return
+    with tempfile.TemporaryDirectory(prefix="soundlab-keep-") as tmp:
+        tmp_dir = Path(tmp)
+
+        def _render_batch(segments: list[list[float]], dest: Path) -> None:
+            inputs, parts = [], []
+            for i, (a, b) in enumerate(segments):
+                inputs += ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", str(src)]
+                fade = min(CUT_FADE, (b - a) / 2)
+                parts.append(f"[{i}:a]afade=t=in:d={fade:.4f},areverse,afade=t=in:d={fade:.4f},areverse[s{i}]")
+            parts.append("".join(f"[s{i}]" for i in range(len(segments))) + f"concat=n={len(segments)}:v=0:a=1[out]")
+            _ffmpeg(*inputs, "-filter_complex", ";".join(parts), "-map", "[out]", *codec_args, str(dest))
+
+        if len(keep) <= KEEP_CHUNK:
+            _render_batch(keep, out)
+            return
+
+        chunk_files = []
+        for idx, i in enumerate(range(0, len(keep), KEEP_CHUNK)):
+            batch = keep[i : i + KEEP_CHUNK]
+            c_file = tmp_dir / f"chunk_{idx}.wav"
+            _render_batch(batch, c_file)
+            chunk_files.append(c_file)
+
+        list_file = tmp_dir / "concat_list.txt"
+        list_file.write_text("\n".join(f"file '{c.resolve().as_posix()}'" for c in chunk_files), encoding="utf-8")
+        _ffmpeg("-f", "concat", "-safe", "0", "-i", str(list_file), *codec_args, str(out))
+
+
+def _balance_expr(items: list[str]) -> str:
+    """Combines a list of boolean expressions into a balanced binary tree to avoid FFmpeg recursion limits."""
+    if not items:
+        return "0"
+    if len(items) == 1:
+        return items[0]
+    mid = len(items) // 2
+    return f"({_balance_expr(items[:mid])}+{_balance_expr(items[mid:])})"
+
+
+def _frame_counts(durations: list[float], fps: Fraction) -> list[int]:
+    """Frames per segment so every segment boundary lands within half a frame of the audio's: rounding
+    each segment on its own would let the picture drift from the sound by up to a frame per cut."""
+    counts, total, prev = [], 0.0, 0
+    for d in durations:
+        total += d
+        end = round(total * fps)
+        counts.append(end - prev)
+        prev = end
+    return counts
+
+
+def keep_video_segments(src: Path, segments: list[tuple[float, float]], tight_audio: Path, out: Path) -> None:
+    """Writes the given (source start, duration) segments of a video src back to back in one pass,
+    muxed with tight_audio (the same segments' audio, already cut and faded).
+
+    The picture is resampled to a constant frame rate (fps=…:start_time=0, so frame n shows source time
+    n / fps) and whole frames are picked per segment: segment k gets as many frames as its audio
+    needs (_frame_counts), so the cuts stay in sync however many there are.
+    """
+    if not segments:
+        return
+    fps = Fraction(probe_video_info(src)["fps"])
+    counts = _frame_counts([d for _, d in segments], fps)
+    conds, next_free = [], 0
+    for (a, _), n in zip(segments, counts):
+        first = max(round(a * fps), next_free)  # segments never share a frame
+        if n > 0:
+            conds.append(f"between(n,{first},{first + n - 1})")
+        next_free = first + n
+    with tempfile.TemporaryDirectory(prefix="soundlab-vidcut-") as tmp:
+        filter_str = (f"[0:v]fps=fps={fps}:start_time=0,select='{_balance_expr(conds)}',"
+                      f"setpts=N/({fps}*TB)[outv]")
+        script_file = Path(tmp) / "video_filter.txt"
+        script_file.write_text(filter_str, encoding="utf-8")
+        _ffmpeg("-i", str(src), "-i", str(tight_audio),
+                "-/filter_complex", str(script_file),
+                "-map", "[outv]", "-map", "1:a", *VIDEO_CODEC, str(out))
 
 
 def pause_threshold(threshold: float, speech_db: float, max_pause: float) -> float:
@@ -198,7 +345,7 @@ def pause_threshold(threshold: float, speech_db: float, max_pause: float) -> flo
 
 
 def tighten(src: Path, start: float, end: float, out_dir: Path, max_pause: float = PAUSE_MAX) -> dict | None:
-    """A tightened copy of src[start:end] → <name>_tight.wav (+ .json report) in out_dir.
+    """A tightened copy of src[start:end] → <name>_tight.wav (or .mp4) (+ .json report) in out_dir.
 
     Silence at both ends is trimmed to a short lead-in / decay (speech_bounds) and inner pauses longer
     than max_pause are cut down to it (pause_cuts). The source is left untouched; None if there is
@@ -228,26 +375,35 @@ def tighten(src: Path, start: float, end: float, out_dir: Path, max_pause: float
         removed = total - sum(b - a for a, b in keep)
         if removed < 0.05:
             return None
+        is_video = has_video_stream(src)
+        ext = ".mp4" if is_video else ".wav"
         base = src.stem.removesuffix("_tight")
         out_dir.mkdir(parents=True, exist_ok=True)
-        out, n = out_dir / f"{base}_tight.wav", 2
+        out, n = out_dir / f"{base}_tight{ext}", 2
         while out.exists():
-            out, n = out_dir / f"{base}_tight-{n}.wav", n + 1
-        keep_segments(part, keep, out, ["-c:a", "pcm_s24le"])
+            out, n = out_dir / f"{base}_tight-{n}{ext}", n + 1
+        if is_video:
+            tight_audio = Path(tmp) / "tight_audio.wav"
+            keep_segments(part, keep, tight_audio, ["-c:a", "pcm_s24le"])
+            # the same rounding keep_segments' -ss / -t use, so picture and sound cut at the same points
+            segments = [(float(f"{start:.3f}") + float(f"{a:.3f}"), float(f"{b - a:.3f}")) for a, b in keep]
+            keep_video_segments(src, segments, tight_audio, out)
+        else:
+            keep_segments(part, keep, out, ["-c:a", "pcm_s24le"])
     data = {
         "source": str(src), "output": str(out), "created_at": datetime.now().isoformat(timespec="seconds"),
         "tightened": True, "range": [round(start, 3), round(end, 3)], "max_pause_sec": max_pause,
         "threshold_db": round(threshold, 2), "speech_db": speech_db, "cut_below_db": round(cut_at, 2),
         "trimmed_sec": [round(max(0.0, keep[0][0]), 2), round(max(0.0, total - keep[-1][1]), 2)],
         "pauses_shortened": len(keep) - 1, "removed_sec": round(removed, 2),
-        "duration_sec": round(probe_duration(out), 2), "keep": keep,
+        "duration_sec": round(probe_duration(out), 2), "keep": keep, "is_video": is_video,
     }
     out.with_suffix(".json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
     return data
 
 
 def extract(src: Path, start: float, end: float, out_dir: Path) -> dict:
-    """src[start:end] as a file of its own → <name>_part.wav (+ .json report) in out_dir.
+    """src[start:end] as a file of its own → <name>_part.wav (or .mp4) (+ .json report) in out_dir.
 
     The editor's "copy the selection to a new track": the new track is a recording of its own, not
     a view into the source. The source is left untouched. Levels measured for Tighten carry over, so
@@ -255,12 +411,25 @@ def extract(src: Path, start: float, end: float, out_dir: Path) -> dict:
     """
     if end - start < 0.05:
         raise PipelineError("The selection is too short")
+    is_video = has_video_stream(src)
+    ext = ".mp4" if is_video else ".wav"
     base = re.sub(r"_part(-\d+)?$", "", src.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out, n = out_dir / f"{base}_part.wav", 2
+    out, n = out_dir / f"{base}_part{ext}", 2
     while out.exists():
-        out, n = out_dir / f"{base}_part-{n}.wav", n + 1
-    render([Clip(src, start, end, 1.0)], out, ["-c:a", "pcm_s24le"])
+        out, n = out_dir / f"{base}_part-{n}{ext}", n + 1
+    if is_video:
+        dur = end - start
+        fade = min(EDGE_FADE, dur / 2)
+        filter_str = (
+            f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS[outv];"
+            f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:d={fade:.4f},areverse,afade=t=in:d={fade:.4f},areverse[outa]"
+        )
+        _ffmpeg("-i", str(src), "-filter_complex", filter_str,
+                "-map", "[outv]", "-map", "[outa]", *VIDEO_CODEC, str(out))
+    else:
+        render([Clip(src, start, end, 1.0)], out, ["-c:a", "pcm_s24le"])
     try:
         prev = json.loads(src.with_suffix(".json").read_text())
     except (OSError, ValueError):
@@ -268,6 +437,7 @@ def extract(src: Path, start: float, end: float, out_dir: Path) -> dict:
     data = {
         "source": str(src), "output": str(out), "created_at": datetime.now().isoformat(timespec="seconds"),
         "part": True, "range": [round(start, 3), round(end, 3)], "duration_sec": round(probe_duration(out), 2),
+        "is_video": is_video,
         **{k: prev[k] for k in ("threshold_db", "speech_db") if k in prev},
     }
     out.with_suffix(".json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
@@ -287,23 +457,89 @@ def _export_path(root: Path, fmt: str, tag: str = "") -> Path:
     return out
 
 
+ENHANCE_SHARE = 0.6  # video export: share of the progress bar for enhancing the audio; the encode gets the rest
+
+
+def _render_video(clips: list[Clip], audio: Path, out: Path, tmp: Path, progress: Progress | None) -> None:
+    """Puts the timeline's picture under its (rendered, maybe enhanced) audio track → MP4.
+
+    Each clip's picture is trimmed, sped up like its audio, scaled and padded to the first video
+    clip's size; audio-only clips get a black picture. Every clip gets exactly as many frames as its
+    audio lasts (atempo's length differs from (end - start) / speed by up to ~20 ms, so it is
+    measured, not computed), rounded on the running total so the picture never drifts from the sound.
+    """
+    clips = merge_continuous(clips)  # as render() does: segments match the audio's one for one
+    ref = next(c for c in clips if has_video_stream(c.path))
+    info = probe_video_info(ref.path)
+    w, h, fps = info["width"], info["height"], Fraction(info["fps"])
+    durations = []
+    for i, c in enumerate(clips):  # each clip's audio renders on its own exactly as inside the join
+        part = tmp / f"clip_{i}.wav"
+        render([c], part, ["-c:a", "pcm_f32le"])
+        durations.append(probe_duration(part))
+        part.unlink()
+    counts = _frame_counts(durations, fps)
+    inputs, parts = [], []
+    for i, (c, n) in enumerate(zip(clips, counts)):
+        if has_video_stream(c.path):
+            inputs += ["-i", str(c.path)]
+            idx = len(inputs) // 2 - 1
+            chain = f"[{idx}:v]trim=start={c.start:.3f}:end={c.end:.3f},setpts=PTS-STARTPTS"
+            if abs(c.speed - 1.0) > 1e-3:
+                chain += f",setpts=PTS/{c.speed:.3f}"
+            chain += (f",fps=fps={fps}:start_time=0,scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                      f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,"
+                      f"tpad=stop_mode=clone:stop={n},trim=end_frame={n},setpts=PTS-STARTPTS[v{i}]")
+        else:
+            chain = (f"color=c=black:s={w}x{h}:r={fps},format=yuv420p,setsar=1,"
+                     f"trim=end_frame={n},setpts=PTS-STARTPTS[v{i}]")
+        parts.append(chain)
+    parts.append("".join(f"[v{i}]" for i in range(len(clips))) + f"concat=n={len(clips)}:v=1:a=0[outv]")
+    inputs += ["-i", str(audio)]
+    script = tmp / "timeline_video_filter.txt"
+    script.write_text(";".join(parts), encoding="utf-8")
+    video = tmp / "video.mp4"  # moved into place when done: a cancel leaves no half-written file
+    ffmpeg_progress([*inputs, "-/filter_complex", str(script), "-map", "[outv]", "-map", f"{len(inputs) // 2 - 1}:a",
+                     *VIDEO_CODEC, str(video)], sum(durations), progress)
+    shutil.move(str(video), str(out))
+
+
 def export_timeline(clips: list[Clip], enhance_it: bool = True, opts: EnhanceOptions | None = None,
                     log: Callable[[str], None] = print, progress: Progress | None = None) -> dict:
     """Renders the timeline, enhancing it if asked; output + JSON report go to outputs/YYYY-MM-DD/."""
     opts = opts or EnhanceOptions()
+    has_video = any(has_video_stream(c.path) for c in clips)
     if opts.fmt not in CODECS:
         raise PipelineError(f"Unknown format: {opts.fmt}")
-    out = _export_path(resolve_outputs(opts), opts.fmt, f"{opts.denoiser}_" if enhance_it and opts.denoiser in GENERATIVE else "")
+    fmt = "mp4" if has_video else opts.fmt
+    out = _export_path(resolve_outputs(opts), fmt, f"{opts.denoiser}_" if enhance_it and opts.denoiser in GENERATIVE else "")
 
     with tempfile.TemporaryDirectory(prefix="soundlab-edit-") as tmp:
         joined = Path(tmp) / "joined.wav"
         render(clips, joined, ["-c:a", "pcm_f32le"])
-        if enhance_it:
-            data = enhance(joined, opts, log=log, out=out, progress=progress).data
-            data["source"] = "timeline"
+        if has_video:
+            report = progress or (lambda _: None)
+            if enhance_it:
+                enhanced_audio = Path(tmp) / "enhanced.wav"
+                data = enhance(joined, opts, log=log, out=enhanced_audio,
+                               progress=lambda f: report(ENHANCE_SHARE * f)).data
+                data["source"] = "timeline"
+            else:
+                enhanced_audio = joined
+                data = {"source": "timeline"}
+            start = ENHANCE_SHARE if enhance_it else 0.0
+            _render_video(clips, enhanced_audio, out, Path(tmp),
+                          lambda f: report(start + (1.0 - start) * f) if progress else None)
+            data["output"] = str(out)
+            data["duration_sec"] = round(probe_duration(out), 2)
+            data["is_video"] = True
         else:
-            _ffmpeg("-i", str(joined), *CODECS[opts.fmt], str(out))
-            data = {"source": "timeline", "output": str(out), "duration_sec": round(probe_duration(out), 2)}
+            if enhance_it:
+                data = enhance(joined, opts, log=log, out=out, progress=progress).data
+                data["source"] = "timeline"
+            else:
+                _ffmpeg("-i", str(joined), *CODECS[opts.fmt], str(out))
+                data = {"source": "timeline", "output": str(out), "duration_sec": round(probe_duration(out), 2)}
 
     data["clips"] = [{**asdict(c), "path": str(c.path)} for c in clips]
     data["enhanced"] = enhance_it
