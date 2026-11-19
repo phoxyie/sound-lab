@@ -25,7 +25,8 @@ from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 from werkzeug.serving import make_server
 
 from . import projects
-from .editor import PAUSE_MAX, Clip, export_timeline, extract, keep_segments, render, tighten
+from .editor import (PAUSE_MAX, Clip, export_timeline, extract, has_audio_stream, has_video_stream,
+                    keep_segments, render, tighten)
 from .pipeline import (CODECS, PROJECT_ROOT, RESEMBLE_NFE_MAX, RESEMBLE_RATE_A, RESEMBLE_RATE_B, RESEMBLE_SEED_MAX,
                        RESEMBLE_SOLVERS, Cancelled,
                        EnhanceOptions, PipelineError, Progress, ResembleSettings, _ffmpeg, enhance, find_resemble,
@@ -35,16 +36,31 @@ from .recorder import Recorder, list_audio_devices, pick_device
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 # Overridable via environment so tests don't touch the real Trash or open Finder
-TRASH_DIR = Path(os.environ.get("SOUNDLAB_TRASH", "~/.Trash")).expanduser()
-REVEAL_CMD = os.environ.get("SOUNDLAB_REVEAL_CMD", "open -R").split()
+# Windows: a folder of our own in the user's home (the Recycle Bin needs a shell API; the temp folder
+# gets emptied by the system, which would make "delete" final)
+_default_trash = Path("~/SoundLab Trash").expanduser() if os.name == "nt" else Path("~/.Trash").expanduser()
+TRASH_DIR = Path(os.environ.get("SOUNDLAB_TRASH", _default_trash)).expanduser()
+_default_reveal = ["explorer", "/select,"] if os.name == "nt" else ["open", "-R"]
+REVEAL_CMD = os.environ.get("SOUNDLAB_REVEAL_CMD", "").split() if "SOUNDLAB_REVEAL_CMD" in os.environ else _default_reveal
 # Some browsers won't play the types the system guesses (e.g. audio/mp4a-latm)
 MIME_TYPES = {".wav": "audio/wav", ".m4a": "audio/mp4", ".mp3": "audio/mpeg", ".aiff": "audio/aiff",
               ".aif": "audio/aiff", ".flac": "audio/flac", ".aac": "audio/aac", ".caf": "audio/x-caf",
               ".ogg": "audio/ogg"}
 AUDIO_EXTS = set(MIME_TYPES)
+VIDEO_MIME_TYPES = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".m4v": "video/x-m4v",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+}
+VIDEO_EXTS = set(VIDEO_MIME_TYPES)
+MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
+ALL_MIME_TYPES = {**MIME_TYPES, **VIDEO_MIME_TYPES}
 TARGET_MIN, TARGET_MAX = -30.0, -9.0
 # Timeline previews: one WAV with trim/speed applied (no enhancement), cached by a content hash
 PREVIEW_DIR = Path(tempfile.gettempdir()) / "soundlab-preview"
+AUDIO_PROXY_DIR = Path(tempfile.gettempdir()) / "soundlab-audio-proxy"  # a video's sound for the waveform
 PREVIEW_KEEP = 20
 JOBS_KEEP = 20  # finished jobs kept for status polling
 GUI_DENOISERS = ["auto", "resemble", "sidon"]  # auto = DeepFilterNet (afftdn if it's missing)
@@ -56,6 +72,7 @@ app.config["MAX_CONTENT_LENGTH"] = 2 * 1024**3  # import size limit: 2 GB
 recorder = Recorder()
 _lock = threading.Lock()
 _preview_lock = threading.Lock()
+_proxy_lock = threading.Lock()
 _duration_cache: dict[tuple[str, float], float] = {}
 # Enhance / export run as background jobs (Resemble takes minutes): the browser polls /api/jobs/<id>
 _jobs: dict[str, dict] = {}
@@ -66,11 +83,28 @@ def _rel(p: Path) -> str:
     return p.resolve().relative_to(PROJECT_ROOT).as_posix()
 
 
+def _audio_proxy(p: Path) -> Path:
+    """A video's sound as a cached 48 kHz 16-bit WAV, for the waveform and playback in the browser."""
+    AUDIO_PROXY_DIR.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha1(f"{p}:{p.stat().st_mtime}".encode()).hexdigest()[:16]
+    proxy = AUDIO_PROXY_DIR / f"{key}.wav"
+    with _proxy_lock:  # one extraction per file at a time
+        if not proxy.exists():
+            tmp_proxy = proxy.with_suffix(".tmp.wav")
+            _ffmpeg("-i", str(p), "-vn", "-c:a", "pcm_s16le", "-ar", "48000", str(tmp_proxy))
+            tmp_proxy.replace(proxy)
+            # temp copies, not user files: keep the newest few like the timeline previews
+            for old in sorted(AUDIO_PROXY_DIR.glob("*.wav"), key=lambda f: f.stat().st_mtime)[:-PREVIEW_KEEP]:
+                if old != proxy:
+                    old.unlink(missing_ok=True)
+    return proxy
+
+
 def _resolve_media(rel: str) -> Path:
-    """Resolves a client path, allowing only audio files inside the current project's folders."""
+    """Resolves a client path, allowing only media files inside the current project's folders."""
     p = (PROJECT_ROOT / rel).resolve()
     roots = [d.resolve() for d in projects.current().dirs]
-    if not any(p.is_relative_to(r) for r in roots) or p.suffix.lower() not in AUDIO_EXTS or not p.is_file():
+    if not any(p.is_relative_to(r) for r in roots) or p.suffix.lower() not in MEDIA_EXTS or not p.is_file():
         raise PipelineError(f"Invalid file: {rel}")
     return p
 
@@ -113,7 +147,8 @@ def _scan(roots: list[Path], skip_prefix: str | None = None, processed: bool = F
         if not root.is_dir():
             continue
         for p in root.rglob("*"):
-            if p.suffix.lower() not in AUDIO_EXTS or not p.is_file():
+            suf = p.suffix.lower()
+            if suf not in MEDIA_EXTS or not p.is_file():
                 continue
             rel_parts = p.relative_to(root).parts
             if skip_prefix and any(part.startswith(skip_prefix) for part in rel_parts[:-1]):
@@ -123,6 +158,7 @@ def _scan(roots: list[Path], skip_prefix: str | None = None, processed: bool = F
                 "folder": "/".join(rel_parts[:-1]),
                 "duration": _duration(p), "mtime": p.stat().st_mtime,
                 "enhanced": processed and _is_enhanced(p),
+                "is_video": suf in VIDEO_EXTS,
             })
     files.sort(key=lambda f: f["mtime"], reverse=True)
     return files
@@ -142,7 +178,7 @@ def _projects_payload() -> dict:
     items = []
     for name in projects.list_projects():
         dirs = projects.Project(name).dirs
-        count = sum(1 for d in dirs if d.is_dir() for f in d.rglob("*") if f.suffix.lower() in AUDIO_EXTS)
+        count = sum(1 for d in dirs if d.is_dir() for f in d.rglob("*") if f.suffix.lower() in MEDIA_EXTS)
         items.append({"name": name, "files": count})
     return {"projects": items, "current": projects.current().name}
 
@@ -213,7 +249,7 @@ def import_files():
     for f in request.files.getlist("files"):
         name = "".join(ch for ch in Path(f.filename or "").name if ch not in '/\\:\0').strip() or "import"
         suffix = Path(name).suffix.lower()
-        if suffix not in AUDIO_EXTS:
+        if suffix not in MEDIA_EXTS:
             rejected.append(f"{name} (unsupported type)")
             continue
         dest = _unique(target / f"{Path(name).stem[:100]}{suffix}")
@@ -221,6 +257,10 @@ def import_files():
         if _duration(dest) is None:  # ffprobe can't read it: broken file or wrong extension
             dest.unlink(missing_ok=True)
             rejected.append(f"{name} (unreadable)")
+            continue
+        if suffix in VIDEO_EXTS and not has_audio_stream(dest):
+            dest.unlink(missing_ok=True)
+            rejected.append(f"{name} (no audio track in video)")
             continue
         imported.append(_rel(dest))
     if not imported and rejected:
@@ -230,7 +270,7 @@ def import_files():
 
 @app.post("/api/trash")
 def trash():
-    """Moves the file (and its .json report, if any) to the macOS Trash."""
+    """Moves the file (and its .json report, if any) to the Trash (TRASH_DIR)."""
     p = _resolve_media((request.get_json(silent=True) or {}).get("path", ""))
     if recorder.running and recorder.out and recorder.out.resolve() == p:
         raise PipelineError("Can't delete a file while it is being recorded")
@@ -255,6 +295,9 @@ def audio():
         p = _resolve_media(request.args.get("path", ""))
     except PipelineError:
         abort(404)
+    if p.suffix.lower() in VIDEO_EXTS:
+        proxy = _audio_proxy(p)
+        return send_file(proxy, mimetype="audio/wav", conditional=True)
     return send_file(p, mimetype=MIME_TYPES[p.suffix.lower()], conditional=True)
 
 
@@ -319,7 +362,8 @@ def record_cancel():
 @app.get("/api/config")
 def config():
     return jsonify(presets=list(PRESETS), default_preset=EnhanceOptions.preset,
-                   default_target=EnhanceOptions.target_i, formats=list(CODECS),
+                   default_target=EnhanceOptions.target_i, default_tp=EnhanceOptions.target_tp,
+                   default_min_lufs=EnhanceOptions.min_lufs, formats=list(CODECS),
                    resemble={"installed": find_resemble() is not None, "defaults": asdict(ResembleSettings()),
                              "solvers": RESEMBLE_SOLVERS, "nfe_max": RESEMBLE_NFE_MAX, "seed_max": RESEMBLE_SEED_MAX,
                              "rate": [RESEMBLE_RATE_A, RESEMBLE_RATE_B], "confirm_above_sec": RESEMBLE_CONFIRM_SEC},
@@ -349,6 +393,9 @@ def _enhance_options(body: dict) -> EnhanceOptions:
     target = float(body.get("target", EnhanceOptions.target_i))
     if not (TARGET_MIN <= target <= TARGET_MAX):
         raise PipelineError(f"Target loudness must be between {TARGET_MIN} and {TARGET_MAX} LUFS")
+    min_lufs = float(body.get("min_lufs", EnhanceOptions.min_lufs))
+    if not (-100.0 <= min_lufs <= -30.0):
+        raise PipelineError("Minimum loudness threshold must be between -100 and -30 LUFS")
     denoiser = body.get("denoiser", "auto")
     if denoiser not in GUI_DENOISERS:
         raise PipelineError(f"Unknown denoiser: {denoiser}")
@@ -356,7 +403,8 @@ def _enhance_options(body: dict) -> EnhanceOptions:
         raise PipelineError("Resemble Enhance isn't installed: run ./scripts/install_resemble.sh")
     if denoiser == "sidon" and not find_sidon():
         raise PipelineError("Sidon isn't installed: run ./scripts/install_sidon.sh")
-    return EnhanceOptions(preset=preset, target_i=target, fmt=fmt, outputs_root=projects.current().outputs,
+    return EnhanceOptions(preset=preset, target_i=target, min_lufs=min_lufs, fmt=fmt,
+                          outputs_root=projects.current().outputs,
                           denoiser=denoiser, resemble=_resemble_settings(body.get("resemble")))
 
 
@@ -435,7 +483,7 @@ def enhance_file():
     untouched = start <= 0.01 and end >= duration - 0.01 and abs(speed - 1) < 1e-3
 
     def work(progress: Progress) -> dict:
-        if untouched:
+        if untouched and not has_video_stream(src):
             data = enhance(src, opts, log=lambda _: None, progress=progress).data
         else:
             data = export_timeline([Clip(src, start, end, speed)], enhance_it=True, opts=opts,
@@ -564,17 +612,24 @@ def original():
                     keep_segments(raw, keep, tight, ["-c:a", "pcm_f32le"])
                     raw = tight
                 target = measure_loudness(p)["lufs"]
-                gain = target - measure_loudness(raw)["lufs"]
+                raw_lufs = measure_loudness(raw)["lufs"]
+                if target <= -90.0 or raw_lufs <= -90.0:
+                    gain = 0.0
+                else:
+                    gain = max(-40.0, min(40.0, target - raw_lufs))
                 tmp_out = out.with_name(out.stem + ".tmp.wav")
                 # The limiter keeps the raised original from clipping (-1 dBFS ceiling) but takes some
                 # loudness back, so measure again and make up the difference
                 for _ in range(3):
                     _ffmpeg("-i", str(raw), "-af", f"volume={gain:.2f}dB,alimiter=limit=0.891:level=false",
                             "-c:a", "pcm_s16le", str(tmp_out))
-                    miss = target - measure_loudness(tmp_out)["lufs"]
+                    out_lufs = measure_loudness(tmp_out)["lufs"]
+                    if out_lufs <= -90.0:
+                        break
+                    miss = target - out_lufs
                     if abs(miss) < 0.3:
                         break
-                    gain += miss
+                    gain += max(-10.0, min(10.0, miss))
                 tmp_out.replace(out)
                 gain_file.write_text(json.dumps({"gain_db": round(gain, 1)}))
     return jsonify(url=f"/api/preview/{name}", duration=_duration(out),
