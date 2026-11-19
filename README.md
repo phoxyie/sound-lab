@@ -3,6 +3,11 @@
 Brings voice recordings made on a MacBook's built-in mic up to social media / podcast standard
 (default **-16 LUFS, -1.5 dBTP**).
 
+Runs on **macOS** (recording uses CoreAudio) and needs **ffmpeg**. Windows support and video
+(mp4/mov) editing are on the experimental
+[`windows-video`](https://github.com/phoxyie/sound-lab/tree/windows-video) branch, not yet tested
+as thoroughly as `main`.
+
 ## Setup
 
 ```bash
@@ -229,4 +234,15 @@ Without step 4, loudnorm silently drops from linear to *dynamic* mode on quiet r
 (pumping). The same happens when the measured LRA exceeds the target, so the last pass stretches
 the LRA target to the measured value. The report's `normalization_type` field shows which mode ran.
 
-Roadmap: [BACKLOG.md](BACKLOG.md)
+## License and credits
+
+Sound Lab is released under the [MIT License](LICENSE).
+
+- [wavesurfer.js](https://github.com/katspaugh/wavesurfer.js) 7.12.12 is bundled in
+  `soundlab/web/vendor/` under the BSD 3-Clause License ([notice](soundlab/web/vendor/LICENSE)).
+- Downloaded by the install scripts, not bundled, each under its own license:
+  [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet),
+  [Resemble Enhance](https://github.com/resemble-ai/resemble-enhance),
+  [Sidon](https://github.com/sarulab-speech/Sidon) and
+  [w2v-BERT 2.0](https://huggingface.co/facebook/w2v-bert-2.0).
+- [ffmpeg](https://ffmpeg.org) is installed separately.

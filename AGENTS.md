@@ -3,6 +3,8 @@
 Personal macOS tool for social-media voice content recorded on a MacBook's built-in mic: record,
 clean up (DeepFilterNet3 + 2-pass loudnorm, default -16 LUFS / -1.5 dBTP), trim, speed up, join and
 export. CLI (`soundlab`) plus a local web GUI. Usage docs: `README.md`; roadmap: `BACKLOG.md`.
+Published as open source (MIT) at `github.com/phoxyie/sound-lab`; branch `windows-video` holds
+unreviewed Windows + video (mp4/mov) support, not merged into `main`.
 
 ## Stack
 
@@ -26,7 +28,8 @@ export. CLI (`soundlab`) plus a local web GUI. Usage docs: `README.md`; roadmap:
 - `scripts/` — `install_deepfilter.sh`, `install_resemble.sh`, `install_sidon.sh`
 - `tests/e2e_gui.py` — GUI end-to-end test
 - Untracked: `tools/` (binaries, tool venvs, models), `projects/` (user data), `.venv/`
-- Docs: `README.md` (usage, pipeline), `BACKLOG.md` (roadmap, phase checklists), `oxob-docs/` (oxob)
+- Docs: `README.md` (usage, pipeline, license and credits), `LICENSE` (MIT); local only, removed from the
+  public GitHub copy: `BACKLOG.md` (roadmap, phase checklists), `oxob-docs/` (oxob)
 
 ## Commands
 

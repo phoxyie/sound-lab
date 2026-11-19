@@ -20,7 +20,7 @@ dist/
 *.aac
 *.flac
 
-# One-off session note (see CLAUDE.md)
+# One-off session note
 HANDOFF.md
 
 # Local env / editors / OS
