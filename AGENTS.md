@@ -1,15 +1,15 @@
 # Sound Lab
 
-Personal tool for social-media voice content recorded on a MacBook's built-in mic: record,
+Personal macOS tool for social-media voice content recorded on a MacBook's built-in mic: record,
 clean up (DeepFilterNet3 + 2-pass loudnorm, default -16 LUFS / -1.5 dBTP), trim, speed up, join and
-export audio, and video (mp4/mov…) with its sound. macOS first, Windows supported (written on Windows,
-tested there by the user only). CLI (`soundlab`) plus a local web GUI. Usage docs: `README.md`;
-roadmap: `BACKLOG.md`. Published as open source (MIT) at `github.com/phoxyie/sound-lab`.
+export. CLI (`soundlab`) plus a local web GUI. Usage docs: `README.md`; roadmap: `BACKLOG.md`.
+Published as open source (MIT) at `github.com/phoxyie/sound-lab`; branch `windows-video` holds
+unreviewed Windows + video (mp4/mov) support, not merged into `main`.
 
 ## Stack
 
 - Python >= 3.10, setuptools (`pyproject.toml`); deps: Flask, sounddevice (CoreAudio). No torch in soundlab.
-- ffmpeg (Homebrew; 7+ for the video paths' `-/filter_complex` script files) for all audio and video rendering; `deep-filter` binary in `tools/` (falls back to ffmpeg `afftdn`).
+- ffmpeg (Homebrew) for all audio rendering; `deep-filter` binary in `tools/` (falls back to ffmpeg `afftdn`).
 - Optional generative denoisers, each in its own venv under `tools/` with pinned versions and
   checksummed models: Resemble Enhance (Python 3.10/3.11), Sidon (Python 3.11+).
 - Frontend: plain JS/HTML/CSS, no build step; wavesurfer.js 7.12.12 vendored (core, regions, timeline — same version).
@@ -20,15 +20,13 @@ roadmap: `BACKLOG.md`. Published as open source (MIT) at `github.com/phoxyie/sou
 - `soundlab/pipeline.py` — enhance pipeline (HPF → denoise → DSP preset → pre-gain + limiter → linear loudnorm); `_run_worker` runs the denoiser workers
 - `soundlab/presets.py` — DSP chains (EQ, de-esser, compressor)
 - `soundlab/resemble_worker.py`, `soundlab/sidon_worker.py` — run in their own venv's Python (subprocess, JSON progress lines on stdout, offline); never imported by soundlab
-- `soundlab/editor.py` — trim (`atrim`) / speed (`atempo`) / join (`concat`) render + export; video:
-  `has_video_stream` / `probe_video_info`, `keep_video_segments` (video Tighten), `_render_video` (video
-  timeline export → MP4, `pipeline.VIDEO_CODEC`; not a `CODECS` format choice)
+- `soundlab/editor.py` — trim (`atrim`) / speed (`atempo`) / join (`concat`) render + export
 - `soundlab/projects.py` — projects; `soundlab/recorder.py` — mic recording via `sounddevice`
 - `soundlab/compare.py` — stage-by-stage A/B variants; `soundlab/cli.py` — CLI entry (`soundlab.cli:main`)
 - `soundlab/gui.py` — Flask API on 127.0.0.1 only; enhance/export are background jobs (`/api/jobs/<id>`, `/cancel`; `progress` callback 0–1 raises `Cancelled`)
 - `soundlab/web/` — single-page frontend (`app.js`, `index.html`, `style.css`); `soundlab/web/vendor/` — wavesurfer.js
 - `scripts/` — `install_deepfilter.sh`, `install_resemble.sh`, `install_sidon.sh`
-- `tests/e2e_gui.py` — GUI end-to-end test; `tests/test_video.py` — video + silent-input tests (unittest)
+- `tests/e2e_gui.py` — GUI end-to-end test
 - Untracked: `tools/` (binaries, tool venvs, models), `projects/` (user data), `.venv/`
 - Docs: `README.md` (usage, pipeline, license and credits), `LICENSE` (MIT); local only, removed from the
   public GitHub copy: `BACKLOG.md` (roadmap, phase checklists), `oxob-docs/` (oxob)
@@ -42,24 +40,15 @@ pip install -e ".[dev]" && playwright install webkit   # test deps, once
 .venv/bin/soundlab gui                     # GUI at http://127.0.0.1:8765
 .venv/bin/soundlab enhance FILE            # also: record, compare, project
 .venv/bin/python tests/e2e_gui.py          # GUI e2e test (WebKit, headless; --headed to watch)
-.venv/bin/python tests/test_video.py       # video tests (~10 s; own projects folder via SOUNDLAB_PROJECTS)
 node --check soundlab/web/app.js           # JS syntax check
 ```
-
-Windows (PowerShell; CMD drops the leading `.\`): `py -m venv .venv`, `.\.venv\Scripts\pip install -e .`,
-`.\.venv\Scripts\soundlab.exe gui` (or `.\.venv\Scripts\Activate.ps1` then `soundlab gui`).
-Windows specifics: `tools\deep-filter.exe` (no install script), tool venvs' `Scripts\python.exe`
-(`pipeline._venv_python`), Trash = `~\SoundLab Trash`, reveal = `explorer /select,`.
 
 ## Data
 
 - `projects/<name>/{inputs,outputs,voice-records}`; current project in `projects/.current` (shared by CLI and GUI).
 - Outputs: `outputs/YYYY-MM-DD/` with a `.json` report next to each file; reports keep absolute paths, re-based after a rename (`gui._report_clips`).
 - GUI timeline lives in browser `localStorage`, keyed by project name, clip paths include the project folder — a rename must migrate both (GUI rename does).
-- Timeline previews render to the system temp dir (`soundlab-preview/`), never into projects; so do
-  the videos' waveform sound proxies (`soundlab-audio-proxy/`, newest 20 kept).
-- Video: `.mp4 .mov .m4v .webm .mkv` (`gui.VIDEO_EXTS`); imports need a sound track. Tighten / extract
-  of a video → `_tight.mp4` / `_part.mp4`; a timeline with any video clip exports `edit_*.mp4`.
+- Timeline previews render to the system temp dir (`soundlab-preview/`), never into projects.
 
 ## Fixed constraints
 
@@ -81,13 +70,6 @@ Windows specifics: `tools\deep-filter.exe` (no install script), tool venvs' `Scr
 - Never capture the mic with ffmpeg `avfoundation`: it drops 512-sample blocks (~7%, clicks). Capture paths are tested by recording a played tone and checking for discontinuities.
 - `atempo` length differs from `(end - start) / speed` by up to ~20 ms: fade-outs anchor to the real end (`areverse,afade,areverse`), never a computed `st=`.
 - Continuous halves of a take render identically only because `editor.merge_continuous` joins them.
-- Video sync: never cut the picture by time per segment (`between(t,…)`, `trim` + `fps`): a frame of
-  rounding per cut drifts (0.3 s after 40 cuts). The picture goes to constant fps and each segment gets
-  `_frame_counts` frames from the audio's real lengths (each clip's audio rendered alone to measure).
-- Video export's ffmpeg runs via `pipeline.ffmpeg_progress` (progress / `Cancelled` kill) into the temp
-  dir, then moves into outputs: a cancel leaves no half-written file.
-- `test_video.py` sets `SOUNDLAB_PROJECTS` to a temporary folder **inside the repo** (`.soundlab-test-projects-*`):
-  the GUI's API paths are relative to the repo, so a projects folder outside it breaks `_rel`.
 - Pause/silence detection uses 20 ms RMS windows (`pipeline.rms_windows`), not `silencedetect` (per-sample, broken by noise peaks). `_tight` reports keep `threshold_db` / `speech_db` and re-tightening reuses them. Slider full left (`pause_threshold`) cuts everything 18 dB under the voice, leaving 0.05 s gaps.
 - Editor playhead is clamped to the trim range (`I`/`O`/arrows move only inside it).
 - wavesurfer timeline plugin tick spacing stops at 1 s; `tuneRuler` sets ticks per zoom.

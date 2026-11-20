@@ -32,6 +32,3 @@ HANDOFF.md
 .oxob/
 **/__pycache__/
 *.pyc
-
-# Test runs (tests/test_video.py) — removed at the end
-.soundlab-test-projects-*/

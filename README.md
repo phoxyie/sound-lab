@@ -3,36 +3,10 @@
 Brings voice recordings made on a MacBook's built-in mic up to social media / podcast standard
 (default **-16 LUFS, -1.5 dBTP**).
 
-Runs on **macOS** (recording uses CoreAudio) and **Windows**, and needs **ffmpeg**. Edits audio and
-video (mp4/mov) files.
-
-## Quick Start: Launch GUI by OS
-
-The web GUI runs at [http://127.0.0.1:8765](http://127.0.0.1:8765) (opens in your default browser automatically).
-
-### Windows
-```powershell
-# PowerShell (direct):
-.\.venv\Scripts\soundlab.exe gui
-
-# Command Prompt (CMD, direct):
-.venv\Scripts\soundlab.exe gui
-
-# Or by activating the virtual environment:
-.\.venv\Scripts\Activate.ps1    # PowerShell
-# or: .venv\Scripts\activate.bat # CMD
-soundlab gui
-```
-
-### macOS
-```bash
-# Direct:
-.venv/bin/soundlab gui
-
-# Or by activating the virtual environment:
-source .venv/bin/activate
-soundlab gui
-```
+Runs on **macOS** (recording uses CoreAudio) and needs **ffmpeg**. Windows support and video
+(mp4/mov) editing are on the experimental
+[`windows-video`](https://github.com/phoxyie/sound-lab/tree/windows-video) branch, not yet tested
+as thoroughly as `main`.
 
 ## Setup
 
@@ -51,12 +25,6 @@ Activate the environment in every new terminal with `source .venv/bin/activate`
 (or call `.venv/bin/soundlab ...` directly).
 
 Without `deep-filter` the pipeline falls back to ffmpeg's `afftdn` denoiser automatically.
-
-On **Windows**: install ffmpeg (7 or newer) so `ffmpeg` / `ffprobe` are on `PATH` (e.g.
-`winget install ffmpeg`), create the venv with `py -m venv .venv` and run `.venv\Scripts\pip install -e .`.
-`install_deepfilter.sh` is macOS only: put the Windows build of deep-filter 0.5.6 from the
-[DeepFilterNet releases](https://github.com/Rikorose/DeepFilterNet/releases) at `tools\deep-filter.exe`,
-or use the `afftdn` fallback. Deleting in the GUI moves files to `~\SoundLab Trash` (not the Recycle Bin).
 
 Optional generative denoisers (see below), each in its own venv under `tools/`, with pinned
 versions and checksummed model files:
@@ -205,17 +173,6 @@ soundlab gui        # opens http://127.0.0.1:8765 in the browser
 
 Edits are non-destructive: source files never change; trim/speed are applied only on export.
 
-### Video
-
-Video files (`.mp4 .mov .m4v .webm .mkv`, with a sound track) can be imported like audio: the
-waveform shows their sound, and the edits apply to picture and sound together.
-
-- **Tighten** / copy to a new track on a video → `<name>_tight.mp4` / `<name>_part.mp4`.
-- **Join & Export** of a timeline with at least one video clip → `edit_HHMMSS.mp4` (H.264 + AAC):
-  every clip is scaled and padded to the first video clip's size and frame rate, audio-only clips get a
-  black picture, and the (enhanced) sound is the same as an audio export's. Each clip gets exactly as
-  many frames as its sound lasts, so picture and sound stay in sync over any number of cuts.
-
 ### Recording
 
 ```bash
@@ -259,10 +216,9 @@ measurements and the chain used.
 ```bash
 pip install -e ".[dev]" && playwright install webkit   # once
 python tests/e2e_gui.py            # GUI end to end (WebKit, headless); --headed to watch
-python tests/test_video.py         # video: Tighten / export sync, progress / cancel, GUI endpoints
 ```
 
-The tests generate their own media files and remove everything they create. It never uses the mic:
+The test generates its own audio files and removes everything it creates. It never uses the mic:
 recording runs on a generated tone (`SOUNDLAB_RECORD_INPUT=tone:330`).
 
 ## Pipeline

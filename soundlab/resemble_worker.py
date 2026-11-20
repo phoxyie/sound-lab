@@ -20,10 +20,6 @@ def emit(**msg) -> None:
 
 
 def main() -> int:
-    import pathlib
-    if sys.platform == "win32":  # the model checkpoint pickles PosixPath objects, which Windows can't load
-        pathlib.PosixPath = pathlib.WindowsPath
-
     src, out, model_dir = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
     tau, nfe, lambd, solver = float(sys.argv[4]), int(sys.argv[5]), float(sys.argv[6]), sys.argv[7]
     seed = int(sys.argv[8])
@@ -57,8 +53,6 @@ def main() -> int:
     for name in ("_euler_step", "_midpoint_step", "_rk4_step"):
         setattr(Solver, name, counted(getattr(Solver, name)))
 
-    # CPU only (AGENTS.md): it crashes on MPS, and the defaults were ear-tested on CPU (another device
-    # changes the result for the same seed)
     load_enhancer(model_dir, "cpu")  # cached: enhance() reuses it
     torch.manual_seed(seed)
     hwav, out_sr = enhance(wav, sr, "cpu", nfe=nfe, solver=solver, lambd=lambd, tau=tau, run_dir=model_dir)

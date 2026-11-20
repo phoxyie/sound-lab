@@ -11,7 +11,6 @@ const COUNTDOWN_KEY = "soundlab.countdown";
 const COUNTDOWN_SEC = 3;
 const TIGHTEN_KEY = "soundlab.tightenPause";
 const ENHANCE_KEY = "soundlab.enhance"; // denoiser choice + Resemble settings
-const GLOBAL_SETTINGS_KEY = "soundlab.globalSettings";
 const NFE_CHOICES = [8, 16, 32, 64, 128];
 const JOB_POLL_MS = 300;
 // Automated tests open the page with ?mute=1 so previews don't play through the speakers
@@ -161,10 +160,9 @@ function toggleGroup(id) {
 }
 
 function itemMeta(f) {
-  const prefix = f.is_video ? "video · " : "";
-  if (f.source === "voice-records") return `${prefix}recording · ${f.folder}`;
-  if (f.source === "inputs") return f.folder ? `${prefix}imported · ${f.folder}` : `${prefix}imported`;
-  return f.folder ? `${prefix}${f.folder}` : (f.is_video ? "video" : "");
+  if (f.source === "voice-records") return `recording · ${f.folder}`;
+  if (f.source === "inputs") return f.folder ? `imported · ${f.folder}` : "imported";
+  return f.folder;
 }
 
 function renderLibrary(flashPath) {
@@ -376,109 +374,15 @@ function fileDropZone(el, openInEditor) {
 
 // ---------- settings ----------
 
-const globalDefaults = { minLufs: -70, targetLufs: -16, mic: null };
-let appConfig = null;
-
 async function initConfig() {
   const cfg = await api("/api/config");
-  appConfig = cfg;
-  globalDefaults.minLufs = cfg.default_min_lufs ?? -70;
-  globalDefaults.targetLufs = cfg.default_target ?? -16;
   const sel = $("preset");
   for (const p of cfg.presets) sel.append(new Option(p === cfg.default_preset ? `${p} (default)` : p, p));
   sel.value = cfg.default_preset;
   $("target").value = String(cfg.default_target);
   markInstalled("sidon", "Sidon", cfg.sidon.installed, "./scripts/install_sidon.sh");
   initResemble(cfg.resemble, { sidon: cfg.sidon.installed });
-  initGlobalSettings();
 }
-
-// The editor's target menu lists -16 / -14; a value set in Settings gets its own entry, so the menu never
-// ends up blank (an empty value would be sent as 0 LUFS and refused)
-function setTarget(value) {
-  const sel = $("target");
-  const v = String(Number(value));
-  if (![...sel.options].some((o) => o.value === v)) sel.append(new Option(`${v} LUFS`, v));
-  sel.value = v;
-}
-
-function loadGlobalSettings() {
-  try {
-    return { ...globalDefaults, ...(JSON.parse(localStorage.getItem(GLOBAL_SETTINGS_KEY)) || {}) };
-  } catch {
-    return { ...globalDefaults };
-  }
-}
-
-function saveGlobalSettings(s) {
-  try {
-    localStorage.setItem(GLOBAL_SETTINGS_KEY, JSON.stringify(s));
-  } catch { /* ignore */ }
-}
-
-function initGlobalSettings() {
-  const s = loadGlobalSettings();
-  $("settings-min-lufs").value = s.minLufs ?? globalDefaults.minLufs;
-  $("settings-target-lufs").value = s.targetLufs ?? globalDefaults.targetLufs;
-  if (s.targetLufs) setTarget(s.targetLufs);
-  updateSettingsBtnIndicator();
-}
-
-function updateSettingsBtnIndicator() {
-  const s = loadGlobalSettings();
-  const changed = s.minLufs !== globalDefaults.minLufs || s.targetLufs !== globalDefaults.targetLufs;
-  $("settings-btn").textContent = changed ? "⚙ Settings •" : "⚙ Settings";
-}
-
-// Global settings panel events
-$("settings-btn").addEventListener("click", (e) => {
-  e.stopPropagation();
-  $("settings-panel").classList.toggle("hidden");
-});
-$("settings-panel").addEventListener("click", (e) => e.stopPropagation());
-document.addEventListener("click", () => $("settings-panel").classList.add("hidden"));
-
-$("settings-min-lufs").addEventListener("change", () => {
-  const val = Number($("settings-min-lufs").value);
-  const s = loadGlobalSettings();
-  s.minLufs = Number.isFinite(val) ? Math.min(Math.max(val, -100), -30) : globalDefaults.minLufs;
-  $("settings-min-lufs").value = s.minLufs;
-  saveGlobalSettings(s);
-  updateSettingsBtnIndicator();
-});
-
-$("settings-target-lufs").addEventListener("change", () => {
-  const val = Number($("settings-target-lufs").value);
-  const s = loadGlobalSettings();
-  s.targetLufs = Number.isFinite(val) ? Math.min(Math.max(val, -30), -9) : globalDefaults.targetLufs;
-  $("settings-target-lufs").value = s.targetLufs;
-  setTarget(s.targetLufs);
-  saveGlobalSettings(s);
-  updateSettingsBtnIndicator();
-});
-
-$("settings-mic").addEventListener("change", () => {
-  const mic = $("settings-mic").value;
-  $("device").value = mic;
-  try { localStorage.setItem(DEVICE_KEY, mic); } catch { /* ignore */ }
-});
-
-$("settings-reset").addEventListener("click", () => {
-  $("settings-min-lufs").value = globalDefaults.minLufs;
-  $("settings-target-lufs").value = globalDefaults.targetLufs;
-  setTarget(globalDefaults.targetLufs);
-  const defMic = globalDefaults.mic;
-  if (defMic) {
-    $("settings-mic").value = defMic;
-    $("device").value = defMic;
-    try { localStorage.setItem(DEVICE_KEY, defMic); } catch { /* ignore */ }
-  }
-  saveGlobalSettings({ ...globalDefaults });
-  updateSettingsBtnIndicator();
-  toast("Settings reset to defaults");
-});
-
-$("settings-done").addEventListener("click", () => $("settings-panel").classList.add("hidden"));
 
 // Optional denoisers that aren't installed stay in the list, disabled, with how to install them
 function markInstalled(value, label, installed, script) {
@@ -572,17 +476,10 @@ function updateDenoiserUI() {
   $("resemble-btn").title = `Resemble Enhance settings${changed ? " (changed from the defaults)" : ""}`;
 }
 
-const enhanceSettings = () => {
-  const g = loadGlobalSettings();
-  return {
-    preset: $("preset").value,
-    target: Number($("target").value),
-    min_lufs: g.minLufs ?? globalDefaults.minLufs,
-    format: $("format").value,
-    denoiser: $("denoiser").value,
-    resemble: resembleSettings(),
-  };
-};
+const enhanceSettings = () => ({
+  preset: $("preset").value, target: Number($("target").value), format: $("format").value,
+  denoiser: $("denoiser").value, resemble: resembleSettings(),
+});
 
 function resultMessage(verb, r) {
   const parts = [`${verb}: ${r.path}`, fmt(r.duration)];
@@ -603,21 +500,12 @@ function resultActions(path) {
 async function initDevices() {
   try {
     const { devices, default: def } = await api("/api/devices");
-    globalDefaults.mic = def;
     const sel = $("device");
-    const setSel = $("settings-mic");
     sel.innerHTML = "";
-    setSel.innerHTML = "";
-    for (const d of devices) {
-      sel.append(new Option(d, d));
-      setSel.append(new Option(d, d));
-    }
+    for (const d of devices) sel.append(new Option(d, d));
     let saved = null;
     try { saved = localStorage.getItem(DEVICE_KEY); } catch { /* ignore */ }
-    const chosen = devices.includes(saved) ? saved : def;
-    sel.value = chosen;
-    setSel.value = chosen;
-    sel.addEventListener("change", () => { setSel.value = sel.value; }); // saved by the listener below
+    sel.value = devices.includes(saved) ? saved : def;
   } catch (e) {
     toast(`Couldn't list microphones: ${e.message}`, "error");
   }
