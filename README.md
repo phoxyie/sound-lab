@@ -3,8 +3,10 @@
 Brings voice recordings made on a MacBook's built-in mic up to social media / podcast standard
 (default **-16 LUFS, -1.5 dBTP**).
 
-Runs on **macOS** (recording uses CoreAudio) and **Windows**, and needs **ffmpeg**. Edits audio and
-video (mp4/mov) files.
+Runs on **macOS** (recording uses CoreAudio) and needs **ffmpeg**. Edits audio and video (mp4/mov)
+files. **Windows** support is experimental: it is written but not yet tested as thoroughly as macOS.
+
+![Sound Lab GUI: media library, editor with two clips (audio and video) and the timeline](docs/screenshot.png)
 
 ## Quick Start: Launch GUI by OS
 

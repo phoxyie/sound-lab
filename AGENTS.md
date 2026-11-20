@@ -30,7 +30,7 @@ roadmap: `BACKLOG.md`. Published as open source (MIT) at `github.com/phoxyie/sou
 - `scripts/` — `install_deepfilter.sh`, `install_resemble.sh`, `install_sidon.sh`
 - `tests/e2e_gui.py` — GUI end-to-end test; `tests/test_video.py` — video + silent-input tests (unittest)
 - Untracked: `tools/` (binaries, tool venvs, models), `projects/` (user data), `.venv/`
-- Docs: `README.md` (usage, pipeline, license and credits), `LICENSE` (MIT); local only, removed from the
+- Docs: `README.md` (usage, pipeline, license and credits; shows `docs/screenshot.png`, the GUI with a generated demo project), `LICENSE` (MIT); local only, removed from the
   public GitHub copy: `BACKLOG.md` (roadmap, phase checklists), `oxob-docs/` (oxob)
 
 ## Commands
